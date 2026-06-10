@@ -1,0 +1,5 @@
+/cmd/server/server
+/server
+*.exe
+.env
+vendor/

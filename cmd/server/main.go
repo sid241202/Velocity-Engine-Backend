@@ -1,0 +1,157 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/handlers"
+	"velocity-engine-control-plane-backend-go/internal/services"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	// Configure structured logging
+	logLevel := slog.LevelInfo
+	switch strings.ToUpper(config.LogLevel) {
+	case "DEBUG":
+		logLevel = slog.LevelDebug
+	case "WARN", "WARNING":
+		logLevel = slog.LevelWarn
+	case "ERROR":
+		logLevel = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+
+	slog.Info("Starting Velocity Engine Control Plane",
+		"host", config.ServerHost,
+		"port", config.ServerPort,
+	)
+
+	// Set Gin mode based on log level
+	if logLevel > slog.LevelDebug {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	// Initialize services
+	liveStore := services.NewLiveStore()
+	wsManager := services.NewWSManager()
+
+	// Bootstrap LiveStore from ClickHouse
+	func() {
+		slog.Info("Bootstrapping LiveStore from ClickHouse...")
+		bootstrapData, err := services.GetLiveResultsMulti([]string{}, 24)
+		if err != nil {
+			slog.Error("Failed to bootstrap LiveStore from ClickHouse", "error", err)
+			return
+		}
+		var allRows []map[string]interface{}
+		for _, rows := range bootstrapData {
+			allRows = append(allRows, rows...)
+		}
+		liveStore.Bootstrap(allRows)
+		slog.Info("LiveStore bootstrapped", "stats", liveStore.StatsString())
+	}()
+
+	// Start Kafka results consumer in background
+	consumer := services.NewResultsConsumer(liveStore, wsManager)
+	consumer.Start()
+
+	// Create handlers
+	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
+	analysisHandler := handlers.NewAnalysisHandler(liveStore)
+	wsHandler := handlers.NewWSHandler(liveStore, wsManager)
+
+	// Setup Gin router
+	router := gin.New()
+	router.Use(gin.Recovery())
+
+	// CORS middleware
+	corsOrigins := strings.Split(config.CORSOrigins, ",")
+	for i := range corsOrigins {
+		corsOrigins[i] = strings.TrimSpace(corsOrigins[i])
+	}
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     corsOrigins,
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"*"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
+	// Register routes — order matters for Gin!
+	// Root & health
+	router.GET("/", rulesHandler.ReadRoot)
+	router.GET("/health", rulesHandler.Health)
+
+	// Static paths BEFORE parameterized routes to avoid conflicts
+	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)
+	router.GET("/rules/agg-analysis", analysisHandler.AggAnalysis)
+	router.POST("/rules/historical-test", analysisHandler.HistoricalTest)
+	router.POST("/rules/historical-analysis", analysisHandler.HistoricalAnalysis)
+
+	// Rule CRUD
+	router.POST("/rules", rulesHandler.CreateRule)
+	router.GET("/rules", rulesHandler.ListRules)
+
+	// Parameterized routes AFTER static paths
+	router.GET("/rules/:rule_id", rulesHandler.GetRule)
+	router.POST("/rules/:rule_id/prod", rulesHandler.PublishRule)
+	router.POST("/rules/:rule_id/status", rulesHandler.UpdateRuleStatus)
+	router.DELETE("/rules/:rule_id", rulesHandler.DeleteRule)
+	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
+
+	// WebSocket routes
+	router.GET("/ws/live-results/:rule_id", wsHandler.LiveResultsWS)
+	router.GET("/ws/live-analysis", wsHandler.LiveAnalysisWS)
+
+	// Create HTTP server
+	addr := fmt.Sprintf("%s:%s", config.ServerHost, config.ServerPort)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: router,
+	}
+
+	// Start server in goroutine
+	go func() {
+		slog.Info("Server listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	slog.Info("Received shutdown signal", "signal", sig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Stop consumer
+	consumer.Stop()
+
+	// Shutdown HTTP server
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("Server forced to shutdown", "error", err)
+	}
+
+	// Close Kafka producer
+	services.CloseProducer()
+
+	// Close ClickHouse
+	services.CloseClickHouse()
+
+	slog.Info("Server exited gracefully")
+}
