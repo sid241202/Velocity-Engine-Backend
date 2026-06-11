@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"os"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 

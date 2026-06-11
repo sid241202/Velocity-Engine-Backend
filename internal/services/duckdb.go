@@ -19,9 +19,6 @@ var icebergS3PathRegex = regexp.MustCompile(`^s3://[a-zA-Z0-9._/-]+$`)
 func init() {
 	if !icebergS3PathRegex.MatchString(config.IcebergS3Path) {
 		slog.Error("Invalid ICEBERG_S3_PATH format", "path", config.IcebergS3Path)
-		if os.Getenv("ENV") == "prod" {
-			panic("Invalid ICEBERG_S3_PATH")
-		}
 	}
 }
 
