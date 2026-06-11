@@ -3,7 +3,7 @@ module velocity-engine-control-plane-backend-go
 go 1.23
 
 require (
-	github.com/ClickHouse/clickhouse-go/v2 v2.30.1
+	github.com/ClickHouse/clickhouse-go/v2 v2.33.1
 	github.com/confluentinc/confluent-kafka-go/v2 v2.6.1
 	github.com/gin-contrib/cors v1.7.3
 	github.com/gin-gonic/gin v1.10.0

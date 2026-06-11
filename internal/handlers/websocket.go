@@ -14,7 +14,19 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins (CORS handled by middleware)
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // Not a CORS request
+		}
+		if config.CORSOrigins == "*" {
+			return true
+		}
+		for _, o := range strings.Split(config.CORSOrigins, ",") {
+			if strings.TrimSpace(o) == origin {
+				return true
+			}
+		}
+		return false
 	},
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,

@@ -77,16 +77,31 @@ func main() {
 
 	// CORS middleware
 	corsOrigins := strings.Split(config.CORSOrigins, ",")
+	var allowOrigins []string
 	for i := range corsOrigins {
-		corsOrigins[i] = strings.TrimSpace(corsOrigins[i])
+		trimmed := strings.TrimSpace(corsOrigins[i])
+		if trimmed != "" {
+			allowOrigins = append(allowOrigins, trimmed)
+		}
 	}
+	allowAll := len(allowOrigins) == 1 && allowOrigins[0] == "*"
+
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     corsOrigins,
+		AllowOrigins:     allowOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"*"},
-		AllowCredentials: true,
+		AllowCredentials: !allowAll,
 		MaxAge:           12 * time.Hour,
 	}))
+
+	// Security Headers Middleware
+	router.Use(func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Content-Security-Policy", "default-src 'self'")
+		c.Next()
+	})
 
 	// Register routes — order matters for Gin!
 	// Root & health
@@ -117,8 +132,12 @@ func main() {
 	// Create HTTP server
 	addr := fmt.Sprintf("%s:%s", config.ServerHost, config.ServerPort)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: router,
+		Addr:              addr,
+		Handler:           router,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start server in goroutine

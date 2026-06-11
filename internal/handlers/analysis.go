@@ -31,7 +31,7 @@ func (h *AnalysisHandler) LiveAnalysis(c *gin.Context) {
 	hoursStr := c.DefaultQuery("hours", "24")
 
 	hours, err := strconv.Atoi(hoursStr)
-	if err != nil {
+	if err != nil || hours <= 0 || hours > 168 {
 		hours = 24
 	}
 	_ = hours // hours is used for LiveStore time-based filtering in future, currently GetAll returns all data
@@ -82,7 +82,7 @@ func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 
 	daysBackStr := c.DefaultQuery("days_back", "7")
 	daysBack, err := strconv.Atoi(daysBackStr)
-	if err != nil {
+	if err != nil || daysBack <= 0 || daysBack > 90 {
 		daysBack = 7
 	}
 
@@ -113,7 +113,7 @@ func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 	)
 	if err != nil {
 		slog.Error("Historical test failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
 		return
 	}
 
@@ -149,7 +149,7 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 	results, err := services.RunHistoricalAnalysis(ruleDict, startTS, endTS)
 	if err != nil {
 		slog.Error("Historical analysis failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
 		return
 	}
 

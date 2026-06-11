@@ -186,7 +186,11 @@ func (h *RulesHandler) PublishRule(c *gin.Context) {
 	if success {
 		record.IsPublished = true
 		record.Status = "ACTIVE"
-		newPayload, _ := json.Marshal(ruleDict)
+		newPayload, err := json.Marshal(ruleDict)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+			return
+		}
 		record.RulePayload = newPayload
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "success",
@@ -239,7 +243,11 @@ func (h *RulesHandler) UpdateRuleStatus(c *gin.Context) {
 	success := services.PublishRule(ruleDict)
 	if success {
 		record.Status = req.Status
-		newPayload, _ := json.Marshal(ruleDict)
+		newPayload, err := json.Marshal(ruleDict)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+			return
+		}
 		record.RulePayload = newPayload
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "success",
@@ -287,7 +295,11 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 	}
 	record.Status = "DRAFT"
 	record.IsPublished = false
-	newPayload, _ := json.Marshal(ruleDict)
+	newPayload, err := json.Marshal(ruleDict)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		return
+	}
 	record.RulePayload = newPayload
 
 	c.JSON(http.StatusOK, gin.H{
@@ -305,6 +317,9 @@ func (h *RulesHandler) LiveResults(c *gin.Context) {
 		if _, err := fmt.Sscanf(l, "%d", &limit); err != nil {
 			limit = 100
 		}
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
 	}
 
 	results, err := services.GetLiveResults(ruleID, limit)

@@ -43,8 +43,7 @@ func (rc *ResultsConsumer) Stop() {
 }
 
 func (rc *ResultsConsumer) run(ctx context.Context) {
-	hostname, _ := os.Hostname()
-	consumerGroup := config.ResultsConsumerGroup + "-" + hostname
+	consumerGroup := config.ResultsConsumerGroup
 	slog.Info("Starting Kafka consumer", "group.id", consumerGroup)
 
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{

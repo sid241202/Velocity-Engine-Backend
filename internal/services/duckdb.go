@@ -14,6 +14,17 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 )
 
+var icebergS3PathRegex = regexp.MustCompile(`^s3://[a-zA-Z0-9._/-]+$`)
+
+func init() {
+	if !icebergS3PathRegex.MatchString(config.IcebergS3Path) {
+		slog.Error("Invalid ICEBERG_S3_PATH format", "path", config.IcebergS3Path)
+		if os.Getenv("ENV") == "prod" {
+			panic("Invalid ICEBERG_S3_PATH")
+		}
+	}
+}
+
 // IcebergSchemaMapping maps Kafka JSON field names (as used by the UI)
 // to Iceberg Parquet column names. This must be kept in sync with the
 // Python ICEBERG_SCHEMA_MAPPING in duckdb_worker.py.
@@ -460,16 +471,24 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 
 	// Configure S3
 	s3Endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "http://"), "https://")
+	safeAccessKey := strings.ReplaceAll(config.S3AccessKey, "'", "''")
+	safeSecretKey := strings.ReplaceAll(config.S3SecretKey, "'", "''")
+
+	useSSL := "true"
+	if strings.HasPrefix(config.S3Endpoint, "http://") {
+		useSSL = "false"
+	}
+
 	s3Stmts := []string{
 		fmt.Sprintf("SET s3_endpoint='%s'", s3Endpoint),
-		fmt.Sprintf("SET s3_access_key_id='%s'", config.S3AccessKey),
-		fmt.Sprintf("SET s3_secret_access_key='%s'", config.S3SecretKey),
+		fmt.Sprintf("SET s3_access_key_id='%s'", safeAccessKey),
+		fmt.Sprintf("SET s3_secret_access_key='%s'", safeSecretKey),
 		"SET s3_url_style='path'",
-		"SET s3_use_ssl=false",
+		fmt.Sprintf("SET s3_use_ssl=%s", useSSL),
 	}
 	for _, stmt := range s3Stmts {
 		if _, err := db.Exec(stmt); err != nil {
-			return nil, fmt.Errorf("failed to set S3 config '%s': %w", stmt, err)
+			return nil, fmt.Errorf("failed to set S3 config") // DO NOT leak stmt in error
 		}
 	}
 

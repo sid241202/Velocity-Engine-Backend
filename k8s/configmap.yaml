@@ -19,7 +19,6 @@ data:
   CLICKHOUSE_TABLE: "velocity_rule_results"
   ICEBERG_S3_PATH: "s3://warehouse/stream_auth.db/auth_txn_raw_union_v1"
   S3_ENDPOINT: "http://minio-svc:9000"
-  S3_ACCESS_KEY: "admin"
   LIVE_STORE_MAX_ROWS: "50000"
   LIVE_STORE_HOURS: "24"
   WS_HEARTBEAT_INTERVAL: "30"
@@ -32,4 +31,5 @@ metadata:
 type: Opaque
 stringData:
   CLICKHOUSE_PASSWORD: ""
+  S3_ACCESS_KEY: "admin"
   S3_SECRET_KEY: "password"

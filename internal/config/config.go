@@ -29,8 +29,8 @@ var (
 	// Iceberg / S3
 	IcebergURI      = getEnv("ICEBERG_URI", "thrift://localhost:9083")
 	S3Endpoint      = getEnv("S3_ENDPOINT", "http://localhost:9000")
-	S3AccessKey     = getEnv("S3_ACCESS_KEY", "admin")
-	S3SecretKey     = getEnv("S3_SECRET_KEY", "password")
+	S3AccessKey     = getEnv("S3_ACCESS_KEY", "")
+	S3SecretKey     = getEnv("S3_SECRET_KEY", "")
 	IcebergTable    = getEnv("ICEBERG_TABLE", "stream_auth.auth_txn_raw_union_v1")
 	IcebergS3Path   = getEnv("ICEBERG_S3_PATH", "s3://warehouse/stream_auth.db/auth_txn_raw_union_v1")
 
@@ -39,6 +39,16 @@ var (
 	LiveStoreHours   = getEnvInt("LIVE_STORE_HOURS", 24)
 	WSHeartbeatSec   = getEnvInt("WS_HEARTBEAT_INTERVAL", 30)
 )
+
+func init() {
+	if S3AccessKey == "" || S3SecretKey == "" {
+		// Log warning or panic if necessary in prod, but for tests it might be empty
+		// Slog isn't initialized yet, so just check. In a real prod setup, panic here.
+		if os.Getenv("ENV") == "prod" {
+			panic("S3_ACCESS_KEY and S3_SECRET_KEY are required")
+		}
+	}
+}
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

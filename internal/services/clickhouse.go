@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sync"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 
-	_ "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
 var (
@@ -22,19 +23,22 @@ var (
 // getClickHouseDB returns the singleton ClickHouse database connection.
 func getClickHouseDB() (*sql.DB, error) {
 	chDBOnce.Do(func() {
-		dsn := fmt.Sprintf("http://%s:%d/%s?username=%s&password=%s&dial_timeout=10s&read_timeout=30s",
-			config.ClickHouseHost,
-			config.ClickHousePort,
-			config.ClickHouseDB,
-			config.ClickHouseUser,
-			config.ClickHousePassword,
-		)
-		db, err := sql.Open("clickhouse", dsn)
-		if err != nil {
-			slog.Error("Failed to open ClickHouse connection", "error", err)
-			chDBErr = err
+		if !regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(config.ClickHouseTable) {
+			slog.Error("Invalid ClickHouseTable config")
+			chDBErr = fmt.Errorf("invalid clickhouse table")
 			return
 		}
+
+		db := clickhouse.OpenDB(&clickhouse.Options{
+			Addr: []string{fmt.Sprintf("%s:%d", config.ClickHouseHost, config.ClickHousePort)},
+			Auth: clickhouse.Auth{
+				Database: config.ClickHouseDB,
+				Username: config.ClickHouseUser,
+				Password: config.ClickHousePassword,
+			},
+			DialTimeout: 10 * time.Second,
+			ReadTimeout: 30 * time.Second,
+		})
 		db.SetMaxOpenConns(10)
 		db.SetMaxIdleConns(5)
 		db.SetConnMaxLifetime(5 * time.Minute)
