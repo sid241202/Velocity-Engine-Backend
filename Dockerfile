@@ -23,7 +23,7 @@ ENV GO111MODULE=on \
     GONOPROXY=bitbucket.uidai.net.in/* \
     GONOSUMDB=bitbucket.uidai.net.in
 
-WORKDIR /
+WORKDIR /app
 
 COPY ./.netrc /root/.netrc
 COPY ./cyclonedx-gomod /usr/local/bin/cyclonedx-gomod
