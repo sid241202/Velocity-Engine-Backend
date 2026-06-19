@@ -43,6 +43,6 @@ USER uidapp
 WORKDIR /home/uidapp
 
 COPY --from=build /SCA-bom.json .
-COPY --from=build /velocity-engine-backend .
+COPY --from=build /app/velocity-engine-backend .
 EXPOSE 8000
 CMD ["/home/uidapp/velocity-engine-backend"]
