@@ -18,7 +18,13 @@ type ExecutionRouting struct {
 }
 
 // FilterNode is a recursive tree structure for AND/OR filter groups.
-// Matches Python FilterNode Pydantic model exactly.
+// Matches Flink FilterNode model exactly.
+//
+// Format is an optional metadata field used by date/time operators:
+//   - "EPOCH_MILLIS" — field value is a Unix timestamp in milliseconds
+//   - "ISO_STRING"   — field value is an ISO-8601 date-time string
+//
+// IS_NULL / IS_NOT_NULL operators omit Value entirely.
 type FilterNode struct {
 	Type       string       `json:"type"`
 	Logic      *string      `json:"logic,omitempty"`
@@ -26,11 +32,13 @@ type FilterNode struct {
 	Field      *string      `json:"field,omitempty"`
 	Operator   *string      `json:"operator,omitempty"`
 	Value      interface{}  `json:"value,omitempty"`
+	Format     *string      `json:"format,omitempty"` // EPOCH_MILLIS | ISO_STRING (date operators only)
 }
 
 // GroupingConfig matches Python GroupingConfig Pydantic model exactly.
 type GroupingConfig struct {
-	Keys []string `json:"keys"`
+	Keys       []string `json:"keys"`
+	EntityName string   `json:"entity_name,omitempty"`
 }
 
 // WindowingConfig matches Python WindowingConfig Pydantic model exactly.
