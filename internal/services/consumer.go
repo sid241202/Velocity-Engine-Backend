@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
-// ResultsConsumer consumes Kafka results messages in a background goroutine.
+// ResultsConsumer subscribes to the Kafka results topic and fans out to:
+//   - LiveStore (in-memory ring buffer)
+//   - WSManager (WebSocket push to subscribed clients)
 type ResultsConsumer struct {
 	cancel    context.CancelFunc
 	liveStore *LiveStore
@@ -19,10 +22,7 @@ type ResultsConsumer struct {
 
 // NewResultsConsumer creates a new results consumer.
 func NewResultsConsumer(ls *LiveStore, wm *WSManager) *ResultsConsumer {
-	return &ResultsConsumer{
-		liveStore: ls,
-		wsManager: wm,
-	}
+	return &ResultsConsumer{liveStore: ls, wsManager: wm}
 }
 
 // Start begins consuming in a background goroutine.
@@ -42,31 +42,7 @@ func (rc *ResultsConsumer) Stop() {
 }
 
 func (rc *ResultsConsumer) run(ctx context.Context) {
-	consumerGroup := config.ResultsConsumerGroup
-	slog.Info("Starting Kafka consumer", "group.id", consumerGroup)
-
-	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  config.KafkaBrokers,
-		"group.id":           consumerGroup,
-		"auto.offset.reset":  "latest",
-		"enable.auto.commit": true,
-		"session.timeout.ms": 30000,
-	})
-	if err != nil {
-		slog.Error("Failed to create Kafka consumer", "error", err)
-		return
-	}
-	defer func() {
-		if cerr := c.Close(); cerr != nil {
-			slog.Error("Error closing Kafka consumer", "error", cerr)
-		}
-	}()
-
-	if err := c.SubscribeTopics([]string{config.ResultsTopic}, nil); err != nil {
-		slog.Error("Failed to subscribe to topic", "error", err)
-		return
-	}
-
+	backoff := 1 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
@@ -74,17 +50,59 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 		default:
 		}
 
-		msg, err := c.ReadMessage(1000) // 1s timeout
+		c, err := kafka.NewConsumer(&kafka.ConfigMap{
+			"bootstrap.servers":  config.KafkaBrokers,
+			"group.id":           config.ResultsConsumerGroup,
+			"auto.offset.reset":  "latest",
+			"enable.auto.commit": true,
+			"session.timeout.ms": 30000,
+		})
 		if err != nil {
-			// Timeout is expected, not an error
-			if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
-				continue
+			slog.Error("Failed to create Kafka results consumer — will retry", "error", err, "backoff", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
 			}
-			slog.Error("Kafka consumer error", "error", err)
+			if backoff < 30*time.Second {
+				backoff = time.Duration(float64(backoff) * 1.5)
+			}
 			continue
 		}
 
-		rc.processMessage(msg.Value)
+		if err := c.SubscribeTopics([]string{config.ResultsTopic}, nil); err != nil {
+			slog.Error("Failed to subscribe to results topic — will retry", "error", err)
+			c.Close()
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
+		backoff = 1 * time.Second // reset on successful connect
+		slog.Info("Results consumer subscribed", "topic", config.ResultsTopic)
+
+		for {
+			select {
+			case <-ctx.Done():
+				c.Close()
+				return
+			default:
+			}
+
+			msg, err := c.ReadMessage(1000) // 1s timeout
+			if err != nil {
+				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
+					continue
+				}
+				slog.Error("Results consumer read error — reconnecting", "error", err)
+				break // inner loop → reconnect outer loop
+			}
+			rc.processMessage(msg.Value)
+		}
+		c.Close()
 	}
 }
 
@@ -115,7 +133,7 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 
 	rc.liveStore.Add(row)
 
-	// New schema uses "id" as the rule identifier; old schema used "ruleId"
+	// New schema uses "id" as rule identifier; old schema used "ruleId"
 	ruleID, _ := row["id"].(string)
 	if ruleID == "" {
 		ruleID, _ = row["ruleId"].(string)
