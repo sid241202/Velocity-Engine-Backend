@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
@@ -91,16 +92,24 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 		default:
 		}
 
+		// Use hostname-appended group ID so each pod gets ALL messages (broadcast pattern).
+		hostname, _ := os.Hostname()
+		groupID := config.AnomalyConsumerGroup + "-" + hostname
+
 		c, err := kafka.NewConsumer(&kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,
-			"group.id":           config.AnomalyConsumerGroup,
+			"group.id":           groupID,
 			"auto.offset.reset":  "latest",
 			"enable.auto.commit": true,
 			"session.timeout.ms": 30000,
 		})
 		if err != nil {
 			slog.Error("Failed to create anomaly Kafka consumer", "error", err)
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
 			if backoff < 30*time.Second {
 				backoff *= 2
 			}
@@ -110,7 +119,11 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 		if err := c.SubscribeTopics([]string{config.AnomalyTopic}, nil); err != nil {
 			slog.Error("Failed to subscribe to anomaly topic", "error", err)
 			c.Close()
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
 			continue
 		}
 
@@ -150,9 +163,19 @@ func (ac *AnomalyConsumer) processAnomaly(value []byte) {
 	// Add event_type discriminator so WS clients can distinguish from agg events
 	evt["event_type"] = "anomaly"
 
+	// Normalize: Flink AnomalyEvent uses "id" but downstream expects "ruleId"
+	if id, ok := evt["id"].(string); ok && id != "" {
+		if _, hasRuleId := evt["ruleId"]; !hasRuleId {
+			evt["ruleId"] = id
+		}
+	}
+
 	ac.anomalyStore.Add(evt)
 
-	ruleID, _ := evt["id"].(string)
+	ruleID, _ := evt["ruleId"].(string)
+	if ruleID == "" {
+		ruleID, _ = evt["id"].(string)
+	}
 	if ruleID == "" {
 		ruleID = "unknown"
 	}

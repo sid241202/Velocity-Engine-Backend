@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
@@ -50,9 +51,15 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 		default:
 		}
 
+		// Use hostname-appended group ID so each pod gets ALL messages (broadcast pattern).
+		// With a static group ID, Kafka distributes partitions across pods — each sees only
+		// a subset of messages, which breaks LiveStore completeness and WebSocket broadcast.
+		hostname, _ := os.Hostname()
+		groupID := config.ResultsConsumerGroup + "-" + hostname
+
 		c, err := kafka.NewConsumer(&kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,
-			"group.id":           config.ResultsConsumerGroup,
+			"group.id":           groupID,
 			"auto.offset.reset":  "latest",
 			"enable.auto.commit": true,
 			"session.timeout.ms": 30000,
@@ -131,12 +138,20 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 	// Add event_type discriminator for frontend routing
 	row["event_type"] = "agg"
 
+	// Normalize: Flink AggregationResult uses "id" but downstream code (ClickHouse queries,
+	// LiveStore, WebSocket) expects "ruleId". Copy id → ruleId for consistency.
+	if id, ok := row["id"].(string); ok && id != "" {
+		if _, hasRuleId := row["ruleId"]; !hasRuleId {
+			row["ruleId"] = id
+		}
+	}
+
 	rc.liveStore.Add(row)
 
 	// New schema uses "id" as rule identifier; old schema used "ruleId"
-	ruleID, _ := row["id"].(string)
+	ruleID, _ := row["ruleId"].(string)
 	if ruleID == "" {
-		ruleID, _ = row["ruleId"].(string)
+		ruleID, _ = row["id"].(string)
 	}
 	if ruleID == "" {
 		ruleID = "unknown"

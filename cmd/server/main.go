@@ -51,7 +51,7 @@ func main() {
 	// Bootstrap LiveStore from ClickHouse
 	func() {
 		slog.Info("Bootstrapping LiveStore from ClickHouse...")
-		bootstrapData, err := services.GetLiveResultsMulti([]string{}, 24)
+		bootstrapData, err := services.GetLiveResultsMulti([]string{}, config.LiveStoreHours)
 		if err != nil {
 			slog.Error("Failed to bootstrap LiveStore from ClickHouse", "error", err)
 			return

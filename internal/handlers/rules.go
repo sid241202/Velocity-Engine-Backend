@@ -68,9 +68,9 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 	}
 
 	// Input validation
+	// Auto-default rule_name to rule_id if not provided
 	if strings.TrimSpace(rule.RuleMetadata.RuleName) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "rule_metadata.rule_name must not be empty"})
-		return
+		rule.RuleMetadata.RuleName = ruleID
 	}
 	if len(rule.Aggregations) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
