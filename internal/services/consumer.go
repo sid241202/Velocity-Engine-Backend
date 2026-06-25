@@ -95,7 +95,14 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 		return
 	}
 
-	// If aggregationResults is a string, re-parse it
+	// New schema: aggResult is a pre-serialized JSON string — parse it for richer display
+	if aggStr, ok := row["aggResult"].(string); ok {
+		var aggMap interface{}
+		if err := json.Unmarshal([]byte(aggStr), &aggMap); err == nil {
+			row["aggResult"] = aggMap
+		}
+	}
+	// Backward compat: old schema used aggregationResults
 	if aggStr, ok := row["aggregationResults"].(string); ok {
 		var aggMap interface{}
 		if err := json.Unmarshal([]byte(aggStr), &aggMap); err == nil {
@@ -103,9 +110,16 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 		}
 	}
 
+	// Add event_type discriminator for frontend routing
+	row["event_type"] = "agg"
+
 	rc.liveStore.Add(row)
 
-	ruleID, _ := row["ruleId"].(string)
+	// New schema uses "id" as the rule identifier; old schema used "ruleId"
+	ruleID, _ := row["id"].(string)
+	if ruleID == "" {
+		ruleID, _ = row["ruleId"].(string)
+	}
 	if ruleID == "" {
 		ruleID = "unknown"
 	}

@@ -36,15 +36,19 @@ var upgrader = websocket.Upgrader{
 
 // WSHandler handles WebSocket endpoints.
 type WSHandler struct {
-	liveStore *services.LiveStore
-	wsManager *services.WSManager
+	liveStore    *services.LiveStore
+	wsManager    *services.WSManager
+	anomalyStore *services.AnomalyStore
+	anomalyWSMgr *services.WSManager
 }
 
 // NewWSHandler creates a new WebSocket handler.
-func NewWSHandler(ls *services.LiveStore, wm *services.WSManager) *WSHandler {
+func NewWSHandler(ls *services.LiveStore, wm *services.WSManager, as *services.AnomalyStore, awm *services.WSManager) *WSHandler {
 	return &WSHandler{
-		liveStore: ls,
-		wsManager: wm,
+		liveStore:    ls,
+		wsManager:    wm,
+		anomalyStore: as,
+		anomalyWSMgr: awm,
 	}
 }
 
@@ -196,4 +200,80 @@ func isTimeout(err error) bool {
 		return te.Timeout()
 	}
 	return false
+}
+
+// AnomalyAnalysisWS handles WS /ws/anomaly-analysis
+// On connect: accept. Wait for subscribe message {type:"subscribe",rule_ids:[...]}.
+// Sends bootstrap snapshot of recent anomaly events, then pushes new ones in real-time.
+func (h *WSHandler) AnomalyAnalysisWS(c *gin.Context) {
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		slog.Error("AnomalyAnalysisWS upgrade failed", "error", err)
+		return
+	}
+	defer func() {
+		h.anomalyWSMgr.Disconnect(conn)
+		conn.Close()
+	}()
+
+	slog.Info("WebSocket anomaly-analysis connected")
+
+	heartbeatInterval := time.Duration(h.anomalyWSMgr.HeartbeatInterval()) * time.Second
+
+	for {
+		conn.SetReadDeadline(time.Now().Add(heartbeatInterval))
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				slog.Info("AnomalyAnalysisWS disconnected normally")
+				return
+			}
+			if isTimeout(err) {
+				heartbeatMsg, _ := json.Marshal(map[string]string{"type": "heartbeat"})
+				if writeErr := h.anomalyWSMgr.WriteToConn(conn, websocket.TextMessage, heartbeatMsg); writeErr != nil {
+					slog.Error("AnomalyAnalysisWS heartbeat failed", "error", writeErr)
+					return
+				}
+				continue
+			}
+			slog.Error("AnomalyAnalysisWS read error", "error", err)
+			return
+		}
+
+		var msg map[string]interface{}
+		if err := json.Unmarshal(message, &msg); err != nil {
+			slog.Warn("Invalid AnomalyAnalysisWS message", "error", err)
+			continue
+		}
+
+		if msg["type"] == "subscribe" {
+			ruleIDsRaw, _ := msg["rule_ids"].([]interface{})
+			var ruleIDs []string
+			for _, id := range ruleIDsRaw {
+				if s, ok := id.(string); ok {
+					ruleIDs = append(ruleIDs, s)
+				}
+			}
+
+			h.anomalyWSMgr.Connect(conn, ruleIDs)
+
+			// Send bootstrap snapshot of recent anomaly events
+			var recentAnomalies []map[string]interface{}
+			if len(ruleIDs) == 0 {
+				recentAnomalies = h.anomalyStore.GetRecent("", 200)
+			} else {
+				for _, rid := range ruleIDs {
+					recentAnomalies = append(recentAnomalies, h.anomalyStore.GetRecent(rid, 50)...)
+				}
+			}
+			bootstrapMsg, _ := json.Marshal(map[string]interface{}{
+				"type": "bootstrap",
+				"data": recentAnomalies,
+			})
+			if err := h.anomalyWSMgr.WriteToConn(conn, websocket.TextMessage, bootstrapMsg); err != nil {
+				slog.Error("AnomalyAnalysisWS bootstrap send failed", "error", err)
+				return
+			}
+		}
+	}
 }

@@ -45,6 +45,8 @@ func main() {
 	// Initialize services
 	liveStore := services.NewLiveStore()
 	wsManager := services.NewWSManager()
+	anomalyStore := services.NewAnomalyStore(10000)
+	anomalyWSMgr := services.NewWSManager()
 
 	// Bootstrap LiveStore from ClickHouse
 	func() {
@@ -66,10 +68,14 @@ func main() {
 	consumer := services.NewResultsConsumer(liveStore, wsManager)
 	consumer.Start()
 
+	// Start Kafka anomaly consumer in background
+	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
+	anomalyConsumer.Start()
+
 	// Create handlers
 	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
 	analysisHandler := handlers.NewAnalysisHandler(liveStore)
-	wsHandler := handlers.NewWSHandler(liveStore, wsManager)
+	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
 
 	// Setup Gin router
 	router := gin.New()
@@ -128,6 +134,7 @@ func main() {
 	// WebSocket routes
 	router.GET("/ws/live-results/:rule_id", wsHandler.LiveResultsWS)
 	router.GET("/ws/live-analysis", wsHandler.LiveAnalysisWS)
+	router.GET("/ws/anomaly-analysis", wsHandler.AnomalyAnalysisWS)
 
 	// Create HTTP server
 	addr := fmt.Sprintf("%s:%s", config.ServerHost, config.ServerPort)
@@ -158,8 +165,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Stop consumer
+	// Stop consumers
 	consumer.Stop()
+	anomalyConsumer.Stop()
 
 	// Shutdown HTTP server
 	if err := srv.Shutdown(ctx); err != nil {

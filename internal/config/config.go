@@ -15,8 +15,10 @@ var (
 	// Kafka
 	KafkaBrokers         = getEnv("KAFKA_BROKERS", "localhost:9092")
 	RulesTopic           = getEnv("RULES_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RULES")
-	ResultsTopic         = getEnv("RESULTS_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RESULTS")
-	ResultsConsumerGroup = getEnv("RESULTS_CONSUMER_GROUP", "velocity-cp-results")
+	ResultsTopic          = getEnv("RESULTS_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RESULTS")
+	ResultsConsumerGroup  = getEnv("RESULTS_CONSUMER_GROUP", "velocity-cp-results")
+	AnomalyTopic          = getEnv("ANOMALY_TOPIC", "DE.AUTH.VELOCITY_ENGINE.ANOMALIES")
+	AnomalyConsumerGroup  = getEnv("ANOMALY_CONSUMER_GROUP", "velocity-cp-anomalies")
 
 	// ClickHouse
 	ClickHouseHost     = getEnv("CLICKHOUSE_HOST", "localhost")
