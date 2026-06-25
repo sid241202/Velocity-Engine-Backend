@@ -11,9 +11,9 @@ type RuleMetadata struct {
 	PenaltyTTLSeconds int    `json:"penalty_ttl_seconds"`
 }
 
-// ExecutionRouting matches Python ExecutionRouting Pydantic model exactly.
+// ExecutionRouting matches Flink ExecutionRouting model.
+// TargetCluster was removed — single-cluster deployment only.
 type ExecutionRouting struct {
-	TargetCluster     string `json:"target_cluster"`
 	TargetSourceTopic string `json:"target_source_topic"`
 }
 
@@ -79,15 +79,15 @@ type HavingThresholds struct {
 // VelocityRule is the top-level rule structure.
 // Matches Flink VelocityRule model exactly.
 type VelocityRule struct {
-	RuleMetadata     RuleMetadata      `json:"rule_metadata"`
-	ExecutionRouting ExecutionRouting   `json:"execution_routing"`
-	Filters          *FilterNode        `json:"filters"`
-	Grouping         GroupingConfig     `json:"grouping"`
-	Windowing        WindowingConfig    `json:"windowing"`
-	Aggregations     []AggregationSpec  `json:"aggregations"`
-	HavingThresholds HavingThresholds   `json:"having_thresholds"`
+	RuleMetadata     RuleMetadata     `json:"rule_metadata"`
+	ExecutionRouting ExecutionRouting  `json:"execution_routing"`
+	Filters          *FilterNode       `json:"filters"`
+	Grouping         GroupingConfig    `json:"grouping"`
+	Windowing        WindowingConfig   `json:"windowing"`
+	Aggregations     []AggregationSpec `json:"aggregations"`
+	HavingThresholds HavingThresholds  `json:"having_thresholds"`
 	// Sinks controls which downstream sinks are active. Passed through to Flink.
-	Sinks            *SinkConfig        `json:"sinks,omitempty"`
+	Sinks            *SinkConfig       `json:"sinks,omitempty"`
 }
 
 // RuleRecord is the in-memory storage record for a rule.
