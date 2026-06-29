@@ -31,7 +31,10 @@ func (as *AnomalyStore) Add(event map[string]interface{}) {
 	defer func() { as.mu <- struct{}{} }()
 	as.events = append(as.events, event)
 	if len(as.events) > as.maxLen {
-		as.events = as.events[len(as.events)-as.maxLen:]
+		// Copy to a new slice to release the old backing array
+		trimmed := make([]map[string]interface{}, as.maxLen)
+		copy(trimmed, as.events[len(as.events)-as.maxLen:])
+		as.events = trimmed
 	}
 }
 

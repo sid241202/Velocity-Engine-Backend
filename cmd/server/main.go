@@ -87,7 +87,14 @@ func main() {
 
 	// Setup Gin router
 	router := gin.New()
+	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
+
+	// Request body size limit (1MB)
+	router.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20) // 1 MB
+		c.Next()
+	})
 
 	// CORS middleware
 	corsOrigins := strings.Split(config.CORSOrigins, ",")

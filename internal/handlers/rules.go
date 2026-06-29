@@ -79,11 +79,10 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 
 	ruleID := rule.RuleMetadata.RuleID
 
-	h.mu.RLock()
+	h.mu.Lock()
 	_, exists := h.rulesDB[ruleID]
-	h.mu.RUnlock()
-
 	if exists {
+		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "Rule with this ID already exists"})
 		return
 	}
@@ -93,21 +92,28 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 	if strings.TrimSpace(rule.RuleMetadata.RuleName) == "" {
 		rule.RuleMetadata.RuleName = ruleID
 	}
-	if len(rule.Aggregations) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
-		return
-	}
-	if rule.Windowing.SizeMs <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.size_ms must be > 0"})
-		return
-	}
-	if rule.Windowing.SlideMs <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.slide_ms must be > 0"})
-		return
-	}
-	if rule.Windowing.Type == "SLIDING" && rule.Windowing.SlideMs > rule.Windowing.SizeMs {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.slide_ms must not exceed windowing.size_ms for SLIDING windows"})
-		return
+	isNoWindowing := strings.EqualFold(rule.Windowing.Type, "NONE")
+	if !isNoWindowing {
+		if len(rule.Aggregations) == 0 {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
+			return
+		}
+		if rule.Windowing.SizeMs <= 0 {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.size_ms must be > 0"})
+			return
+		}
+		if rule.Windowing.SlideMs <= 0 {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.slide_ms must be > 0"})
+			return
+		}
+		if rule.Windowing.Type == "SLIDING" && rule.Windowing.SlideMs > rule.Windowing.SizeMs {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.slide_ms must not exceed windowing.size_ms for SLIDING windows"})
+			return
+		}
 	}
 
 	// Force DRAFT status on creation
@@ -115,6 +121,7 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 
 	rulePayload, err := json.Marshal(rule)
 	if err != nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to serialize rule"})
 		return
 	}
@@ -128,7 +135,6 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 		Version:     1,
 	}
 
-	h.mu.Lock()
 	h.rulesDB[ruleID] = record
 	h.mu.Unlock()
 
@@ -189,43 +195,51 @@ func (h *RulesHandler) GetRule(c *gin.Context) {
 func (h *RulesHandler) PublishRule(c *gin.Context) {
 	ruleID := c.Param("rule_id")
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	h.mu.RLock()
 	record, ok := h.rulesDB[ruleID]
 	if !ok {
+		h.mu.RUnlock()
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Rule not found"})
 		return
 	}
 
 	var ruleDict map[string]interface{}
 	if err := json.Unmarshal(record.RulePayload, &ruleDict); err != nil {
+		h.mu.RUnlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to deserialize rule"})
 		return
 	}
+	h.mu.RUnlock()
 
 	// Force ACTIVE
 	if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
 		rm["status"] = "ACTIVE"
 	}
 
+	// Publish OUTSIDE the lock
 	success := services.PublishRule(ruleDict)
-	if success {
-		record.IsPublished = true
-		record.Status = "ACTIVE"
-		newPayload, err := json.Marshal(ruleDict)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
-			return
-		}
-		record.RulePayload = newPayload
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "success",
-			"message": fmt.Sprintf("Rule %s moved to PROD (ACTIVE)", ruleID),
-		})
-	} else {
+	if !success {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to publish rule to Kafka"})
+		return
 	}
+
+	// Re-acquire lock to update state
+	h.mu.Lock()
+	record.IsPublished = true
+	record.Status = "ACTIVE"
+	newPayload, err := json.Marshal(ruleDict)
+	if err != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		return
+	}
+	record.RulePayload = newPayload
+	h.mu.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": fmt.Sprintf("Rule %s moved to PROD (ACTIVE)", ruleID),
+	})
 }
 
 // StatusUpdateRequest matches the Python StatusUpdateRequest Pydantic model.
@@ -248,64 +262,72 @@ func (h *RulesHandler) UpdateRuleStatus(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	h.mu.RLock()
 	record, ok := h.rulesDB[ruleID]
 	if !ok {
+		h.mu.RUnlock()
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Rule not found"})
 		return
 	}
 
 	var ruleDict map[string]interface{}
 	if err := json.Unmarshal(record.RulePayload, &ruleDict); err != nil {
+		h.mu.RUnlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to deserialize rule"})
 		return
 	}
+	h.mu.RUnlock()
 
 	if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
 		rm["status"] = req.Status
 	}
 
 	success := services.PublishRule(ruleDict)
-	if success {
-		record.Status = req.Status
-		newPayload, err := json.Marshal(ruleDict)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
-			return
-		}
-		record.RulePayload = newPayload
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "success",
-			"message": fmt.Sprintf("Rule %s status updated to %s", ruleID, req.Status),
-		})
-	} else {
+	if !success {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to publish status update to Kafka"})
+		return
 	}
+
+	h.mu.Lock()
+	record.Status = req.Status
+	newPayload, err := json.Marshal(ruleDict)
+	if err != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		return
+	}
+	record.RulePayload = newPayload
+	h.mu.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": fmt.Sprintf("Rule %s status updated to %s", ruleID, req.Status),
+	})
 }
 
 // DeleteRule handles DELETE /rules/:rule_id
 func (h *RulesHandler) DeleteRule(c *gin.Context) {
 	ruleID := c.Param("rule_id")
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	h.mu.RLock()
 	record, ok := h.rulesDB[ruleID]
 	if !ok {
+		h.mu.RUnlock()
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Rule not found"})
 		return
 	}
+	wasPublished := record.IsPublished
 
 	var ruleDict map[string]interface{}
 	if err := json.Unmarshal(record.RulePayload, &ruleDict); err != nil {
+		h.mu.RUnlock()
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to deserialize rule"})
 		return
 	}
+	h.mu.RUnlock()
 
-	// If it was ever published, tell Flink to delete its state
-	if record.IsPublished {
+	// If it was ever published, tell Flink to delete its state (outside lock)
+	if wasPublished {
 		if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
 			rm["status"] = "DELETED"
 		}
@@ -316,31 +338,23 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 		}
 	}
 
-	// Move rule to DELETED status and write tombstone to CSV
+	// Re-acquire lock to remove from memory
+	h.mu.Lock()
 	if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
 		rm["status"] = "DELETED"
 	}
-	record.Status = "DELETED"
-	record.IsPublished = false
-	newPayload, err := json.Marshal(ruleDict)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
-		return
-	}
-	record.RulePayload = newPayload
-
+	newPayload, _ := json.Marshal(ruleDict)
 	newVersion := record.Version + 1
 
-	// Unmarshal back to struct for CSV store
+	// Write tombstone to CSV
 	var ruleToSave models.VelocityRule
 	json.Unmarshal(newPayload, &ruleToSave)
-
 	if h.csvStore != nil {
 		h.csvStore.WriteRule(&ruleToSave, newVersion, false)
 	}
 
-	// Remove from in-memory DB so it doesn't show up in lists anymore
 	delete(h.rulesDB, ruleID)
+	h.mu.Unlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "success",
@@ -412,13 +426,16 @@ func (h *RulesHandler) UpdateRule(c *gin.Context) {
 	if strings.TrimSpace(rule.RuleMetadata.RuleName) == "" {
 		rule.RuleMetadata.RuleName = ruleID
 	}
-	if len(rule.Aggregations) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
-		return
-	}
-	if rule.Windowing.SizeMs <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.size_ms must be > 0"})
-		return
+	isNoWindowing := strings.EqualFold(rule.Windowing.Type, "NONE")
+	if !isNoWindowing {
+		if len(rule.Aggregations) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
+			return
+		}
+		if rule.Windowing.SizeMs <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.size_ms must be > 0"})
+			return
+		}
 	}
 
 	// Force back to DRAFT on edit

@@ -11,37 +11,43 @@ import (
 )
 
 var (
-	producer     *kafka.Producer
-	producerOnce sync.Once
-	producerErr  error
+	producer    *kafka.Producer
+	producerMu  sync.Mutex
 )
 
-// initProducer creates the singleton Kafka producer.
-func initProducer() {
-	producerOnce.Do(func() {
-		p, err := kafka.NewProducer(&kafka.ConfigMap{
-			"bootstrap.servers": config.KafkaBrokers,
-			"acks":              "all",
-			"retries":           3,
-			"linger.ms":         10,
-			"compression.type":  "lz4",
-		})
-		if err != nil {
-			slog.Error("Failed to create Kafka producer", "error", err)
-			producerErr = err
-			return
-		}
-		producer = p
-		slog.Info("Kafka producer initialized", "brokers", config.KafkaBrokers)
+// getProducer returns the singleton Kafka producer, creating it if necessary.
+// Unlike sync.Once, this retries on failure so transient broker unavailability
+// at startup doesn't permanently break publishing.
+func getProducer() (*kafka.Producer, error) {
+	producerMu.Lock()
+	defer producerMu.Unlock()
+
+	if producer != nil {
+		return producer, nil
+	}
+
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": config.KafkaBrokers,
+		"acks":              "all",
+		"retries":           3,
+		"linger.ms":         10,
+		"compression.type":  "lz4",
 	})
+	if err != nil {
+		slog.Error("Failed to create Kafka producer", "error", err)
+		return nil, err
+	}
+	producer = p
+	slog.Info("Kafka producer initialized", "brokers", config.KafkaBrokers)
+	return producer, nil
 }
 
 // PublishRule serializes and publishes a rule dict to the rules Kafka topic.
 // Returns true on success, false on failure.
 func PublishRule(ruleDict map[string]interface{}) bool {
-	initProducer()
-	if producerErr != nil || producer == nil {
-		slog.Error("Kafka producer not available", "error", producerErr)
+	p, err := getProducer()
+	if err != nil {
+		slog.Error("Kafka producer not available", "error", err)
 		return false
 	}
 
@@ -66,7 +72,7 @@ func PublishRule(ruleDict map[string]interface{}) bool {
 	topic := config.RulesTopic
 	deliveryChan := make(chan kafka.Event, 1)
 
-	err = producer.Produce(&kafka.Message{
+	err = p.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
 		Key:            []byte(ruleID),
 		Value:          value,
@@ -77,7 +83,7 @@ func PublishRule(ruleDict map[string]interface{}) bool {
 	}
 
 	// Wait for delivery report with 10s timeout
-	remaining := producer.Flush(10 * 1000)
+	remaining := p.Flush(10 * 1000)
 	if remaining > 0 {
 		slog.Error("Kafka flush timed out", "remaining", remaining)
 		return false
@@ -99,9 +105,12 @@ func PublishRule(ruleDict map[string]interface{}) bool {
 
 // CloseProducer flushes and closes the Kafka producer.
 func CloseProducer() {
+	producerMu.Lock()
+	defer producerMu.Unlock()
 	if producer != nil {
 		producer.Flush(5 * 1000)
 		producer.Close()
+		producer = nil
 		slog.Info("Kafka producer closed")
 	}
 }

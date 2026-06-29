@@ -56,6 +56,9 @@ func newCsvWriter(path string, header []string) (*csvWriter, error) {
 				slog.Error("csvWriter write error", "file", path, "error", err)
 			}
 			cw.Flush()
+			if err := cw.Error(); err != nil {
+				slog.Error("csvWriter flush error", "file", path, "error", err)
+			}
 		}
 	}()
 
