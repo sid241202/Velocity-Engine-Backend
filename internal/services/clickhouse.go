@@ -36,6 +36,7 @@ func getClickHouseDB() (*sql.DB, error) {
 				Username: config.ClickHouseUser,
 				Password: config.ClickHousePassword,
 			},
+			Protocol: clickhouse.HTTP,
 			DialTimeout: 10 * time.Second,
 			ReadTimeout: 30 * time.Second,
 		})
