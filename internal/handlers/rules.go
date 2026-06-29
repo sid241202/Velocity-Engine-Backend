@@ -10,6 +10,7 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/models"
 	"velocity-engine-control-plane-backend-go/internal/services"
+	"velocity-engine-control-plane-backend-go/internal/store"
 
 	"github.com/gin-gonic/gin"
 )
@@ -20,14 +21,16 @@ type RulesHandler struct {
 	rulesDB   map[string]*models.RuleRecord
 	liveStore *services.LiveStore
 	wsManager *services.WSManager
+	csvStore  *store.CSVStore
 }
 
 // NewRulesHandler creates a new RulesHandler.
-func NewRulesHandler(ls *services.LiveStore, wm *services.WSManager) *RulesHandler {
+func NewRulesHandler(ls *services.LiveStore, wm *services.WSManager, cs *store.CSVStore) *RulesHandler {
 	return &RulesHandler{
 		rulesDB:   make(map[string]*models.RuleRecord),
 		liveStore: ls,
 		wsManager: wm,
+		csvStore:  cs,
 	}
 }
 
@@ -122,11 +125,17 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 		Status:      "DRAFT",
 		RulePayload: rulePayload,
 		IsPublished: false,
+		Version:     1,
 	}
 
 	h.mu.Lock()
 	h.rulesDB[ruleID] = record
 	h.mu.Unlock()
+
+	// Persist to CSV store (fire-and-forget via channels)
+	if h.csvStore != nil {
+		h.csvStore.WriteRule(&rule, 1, true)
+	}
 
 	c.JSON(http.StatusOK, rule)
 }
@@ -351,4 +360,76 @@ func (h *RulesHandler) LiveResults(c *gin.Context) {
 		"rule_id": ruleID,
 		"results": results,
 	})
+}
+
+// UpdateRule handles PUT /rules/:rule_id
+// Accepts a full updated VelocityRule payload.
+// Only allowed when rule is in DRAFT or PAUSED status.
+func (h *RulesHandler) UpdateRule(c *gin.Context) {
+	ruleID := c.Param("rule_id")
+
+	var rule models.VelocityRule
+	if err := c.ShouldBindJSON(&rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": fmt.Sprintf("Invalid request body: %s", err.Error())})
+		return
+	}
+
+	// rule_id in payload must match URL param
+	if rule.RuleMetadata.RuleID != ruleID {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "rule_id in payload must match URL parameter"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	record, ok := h.rulesDB[ruleID]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Rule not found"})
+		return
+	}
+
+	// Only editable in DRAFT or PAUSED state
+	if record.Status != "DRAFT" && record.Status != "PAUSED" {
+		c.JSON(http.StatusConflict, gin.H{"detail": fmt.Sprintf("Rule is %s. Pause the rule before editing.", record.Status)})
+		return
+	}
+
+	// Validations (same as create)
+	if strings.TrimSpace(rule.RuleMetadata.RuleName) == "" {
+		rule.RuleMetadata.RuleName = ruleID
+	}
+	if len(rule.Aggregations) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "aggregations list must not be empty"})
+		return
+	}
+	if rule.Windowing.SizeMs <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "windowing.size_ms must be > 0"})
+		return
+	}
+
+	// Force back to DRAFT on edit
+	rule.RuleMetadata.Status = "DRAFT"
+
+	newVersion := record.Version + 1
+
+	rulePayload, err := json.Marshal(rule)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to serialize rule"})
+		return
+	}
+
+	record.RulePayload = rulePayload
+	record.Status = "DRAFT"
+	record.Name = rule.RuleMetadata.RuleName
+	record.Version = newVersion
+	// IsPublished stays as-is (rule was previously published, still tracks history)
+
+	// Persist to CSV store
+	if h.csvStore != nil {
+		h.csvStore.WriteRule(&rule, newVersion, false)
+	}
+
+	slog.Info("Rule updated", "rule_id", ruleID, "version", newVersion)
+	c.JSON(http.StatusOK, rule)
 }

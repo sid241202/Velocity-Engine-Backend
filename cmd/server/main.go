@@ -14,6 +14,7 @@ import (
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/handlers"
 	"velocity-engine-control-plane-backend-go/internal/services"
+	"velocity-engine-control-plane-backend-go/internal/store"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -72,8 +73,15 @@ func main() {
 	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
 	anomalyConsumer.Start()
 
+	// Open CSV persistence store (ephemeral local storage for staging)
+	csvStore, csvErr := store.Open("/tmp/velocity")
+	if csvErr != nil {
+		slog.Warn("CSVStore failed to open — rule persistence disabled", "error", csvErr)
+		csvStore = nil
+	}
+
 	// Create handlers
-	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
+	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager, csvStore)
 	analysisHandler := handlers.NewAnalysisHandler(liveStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
 
@@ -129,6 +137,7 @@ func main() {
 	router.GET("/rules/:rule_id", rulesHandler.GetRule)
 	router.POST("/rules/:rule_id/prod", rulesHandler.PublishRule)
 	router.POST("/rules/:rule_id/status", rulesHandler.UpdateRuleStatus)
+	router.PUT("/rules/:rule_id", rulesHandler.UpdateRule)
 	router.DELETE("/rules/:rule_id", rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 
@@ -177,6 +186,11 @@ func main() {
 
 	// Close Kafka producer
 	services.CloseProducer()
+
+	// Close CSV store (drains write channels)
+	if csvStore != nil {
+		csvStore.Close()
+	}
 
 	// Close ClickHouse
 	services.CloseClickHouse()

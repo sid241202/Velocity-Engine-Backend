@@ -97,4 +97,5 @@ type RuleRecord struct {
 	Status      string          `json:"status"`
 	RulePayload json.RawMessage `json:"rule_payload"`
 	IsPublished bool            `json:"is_published"`
+	Version     int             `json:"version"`
 }
