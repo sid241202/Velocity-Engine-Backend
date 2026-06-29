@@ -25,9 +25,6 @@ ENV GO111MODULE=on \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
-RUN chmod +t /tmp /var/tmp
-
 COPY ./.netrc /root/.netrc
 COPY ./cyclonedx-gomod /usr/local/bin/cyclonedx-gomod
 COPY . .
