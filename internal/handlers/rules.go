@@ -316,11 +316,11 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 		}
 	}
 
-	// Move rule back to DRAFT status (keep in DB for re-publishing)
+	// Move rule to DELETED status and write tombstone to CSV
 	if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
-		rm["status"] = "DRAFT"
+		rm["status"] = "DELETED"
 	}
-	record.Status = "DRAFT"
+	record.Status = "DELETED"
 	record.IsPublished = false
 	newPayload, err := json.Marshal(ruleDict)
 	if err != nil {
@@ -329,9 +329,22 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 	}
 	record.RulePayload = newPayload
 
+	newVersion := record.Version + 1
+
+	// Unmarshal back to struct for CSV store
+	var ruleToSave models.VelocityRule
+	json.Unmarshal(newPayload, &ruleToSave)
+
+	if h.csvStore != nil {
+		h.csvStore.WriteRule(&ruleToSave, newVersion, false)
+	}
+
+	// Remove from in-memory DB so it doesn't show up in lists anymore
+	delete(h.rulesDB, ruleID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "success",
-		"message": fmt.Sprintf("Rule %s removed from Flink and moved back to DRAFT", ruleID),
+		"message": fmt.Sprintf("Rule %s removed from Flink and permanently deleted", ruleID),
 	})
 }
 
