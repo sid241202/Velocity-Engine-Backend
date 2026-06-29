@@ -414,38 +414,32 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 	// IST timezone: UTC+5:30
 	ist := time.FixedZone("IST", 5*60*60+30*60)
 
-	// Resolve time bounds
-	var endDt, startDt time.Time
+    // Helper to parse strings in IST location
+    parseIST := func(ts string) (time.Time, error) {
+        // Ensure format is 2026-06-29 10:30:00
+        formatted := strings.Replace(ts, "T", " ", 1)
+        if len(formatted) == 16 { formatted += ":00" } // Add seconds if missing
+        return time.ParseInLocation("2006-01-02 15:04:05", formatted, ist)
+    }
 
-	if endTS != "" {
-		parsed, err := time.Parse("2006-01-02T15:04:05", endTS)
-		if err != nil {
-			// Try alternate format
-			parsed, err = time.Parse("2006-01-02 15:04:05", endTS)
-			if err != nil {
-				return nil, fmt.Errorf("invalid end_ts format: %w", err)
-			}
-		}
-		endDt = parsed
-	} else {
-		endDt = time.Now().In(ist)
-		// Strip timezone info to match Python behavior
-		endDt = time.Date(endDt.Year(), endDt.Month(), endDt.Day(),
-			endDt.Hour(), endDt.Minute(), endDt.Second(), 0, time.UTC)
-	}
+    var endDt, startDt time.Time
+    var err error
 
-	if startTS != "" {
-		parsed, err := time.Parse("2006-01-02T15:04:05", startTS)
-		if err != nil {
-			parsed, err = time.Parse("2006-01-02 15:04:05", startTS)
-			if err != nil {
-				return nil, fmt.Errorf("invalid start_ts format: %w", err)
-			}
-		}
-		startDt = parsed
-	} else {
-		startDt = endDt.Add(-7 * 24 * time.Hour)
-	}
+    // Resolve endDt
+    if endTS != "" {
+       endDt, err = parseIST(endTS)
+       if err != nil { return nil, fmt.Errorf("invalid end_ts format: %w", err) }
+    } else {
+       endDt = time.Now().In(ist)
+    }
+
+    // Resolve startDt
+    if startTS != "" {
+       startDt, err = parseIST(startTS)
+       if err != nil { return nil, fmt.Errorf("invalid start_ts format: %w", err) }
+    } else {
+       startDt = endDt.Add(-7 * 24 * time.Hour)
+    }
 
 	// Open in-memory DuckDB connection
 	db, err := sql.Open("duckdb", "")
@@ -631,31 +625,24 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 	}
 
 	startStr := startDt.Format("2006-01-02 15:04:05")
-	endStr := endDt.Format("2006-01-02 15:04:05")
+    endStr := endDt.Format("2006-01-02 15:04:05")
 
 	query := fmt.Sprintf(`
-    SELECT
-        time_bucket(INTERVAL '%d seconds', try_cast(%s AS TIMESTAMP)) as window_start,
-        %s,
+        SELECT
+            time_bucket(INTERVAL '%d seconds', try_cast(%s AS TIMESTAMP)) as window_start,
+            %s,
+            %s
+            %s
+        FROM %s
+        WHERE try_cast(%s AS TIMESTAMP) >= try_cast(? AS TIMESTAMP)
+        AND try_cast(%s AS TIMESTAMP) <= try_cast(? AS TIMESTAMP)
         %s
         %s
-    FROM %s
-    WHERE try_cast(%s AS TIMESTAMP) >= try_cast(? AS TIMESTAMP)
-    AND try_cast(%s AS TIMESTAMP) <= try_cast(? AS TIMESTAMP)
-    %s
-    %s
-    ORDER BY window_start DESC
-    LIMIT 1000
-    `, sizeSeconds, windowField,
-		selectKeys,
-		aggClause,
-		thresholdMetCol,
-		icebergSource,
-		windowField,
-		windowField,
-		whereClause,
-		groupByClause,
-	)
+        ORDER BY window_start DESC
+        LIMIT 1000
+        `, sizeSeconds, windowField, selectKeys, aggClause, thresholdMetCol, icebergSource,
+           windowField, windowField, whereClause, groupByClause,
+        )
 
 	// Build params: time range first, then filter params
 	allParams := make([]interface{}, 0, 2+len(filterParams))
@@ -698,10 +685,11 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 			val := values[i]
 			switch v := val.(type) {
 			case time.Time:
-				row[col] = v.Format("2006-01-02 15:04:05")
+				// Format in IST so frontend always sees consistent IST timestamps
+				row[col] = v.In(ist).Format("2006-01-02 15:04:05")
 			case *time.Time:
 				if v != nil {
-					row[col] = v.Format("2006-01-02 15:04:05")
+					row[col] = v.In(ist).Format("2006-01-02 15:04:05")
 				} else {
 					row[col] = nil
 				}

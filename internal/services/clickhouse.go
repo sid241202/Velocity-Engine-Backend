@@ -14,6 +14,10 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
+// istZone is the IST fixed timezone offset (UTC+05:30).
+// All timestamps returned to the frontend are formatted in this zone.
+var istZone = time.FixedZone("IST", 5*60*60+30*60)
+
 var (
 	chDB     *sql.DB
 	chDBOnce sync.Once
@@ -83,12 +87,12 @@ func rowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
 		for i, col := range columns {
 			val := values[i]
 
-			// Convert time.Time to string
+			// Convert time.Time to IST string so the frontend always gets IST-formatted timestamps
 			if t, ok := val.(time.Time); ok {
-				row[col] = t.Format("2006-01-02 15:04:05.000")
+				row[col] = t.In(istZone).Format("2006-01-02 15:04:05")
 			} else if t, ok := val.(*time.Time); ok {
 				if t != nil {
-					row[col] = t.Format("2006-01-02 15:04:05.000")
+					row[col] = t.In(istZone).Format("2006-01-02 15:04:05")
 				} else {
 					row[col] = nil
 				}

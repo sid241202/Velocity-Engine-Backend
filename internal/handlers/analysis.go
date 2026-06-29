@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -51,8 +52,12 @@ func (h *AnalysisHandler) LiveAnalysis(c *gin.Context) {
 // AggAnalysis handles GET /rules/agg-analysis
 func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	ruleIDsParam := c.Query("rule_ids")
-	startTS := c.Query("start_ts")
-	endTS := c.Query("end_ts")
+	// URL-decode timestamps: the frontend sends encodeURIComponent("YYYY-MM-DD HH:MM:SS")
+	// so the space becomes %20 and must be decoded before passing to parseDateTimeBestEffort.
+	startTSRaw, _ := url.QueryUnescape(c.Query("start_ts"))
+	endTSRaw, _ := url.QueryUnescape(c.Query("end_ts"))
+	startTS := strings.TrimSpace(startTSRaw)
+	endTS := strings.TrimSpace(endTSRaw)
 
 	var ids []string
 	for _, r := range strings.Split(ruleIDsParam, ",") {
@@ -62,6 +67,7 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 		}
 	}
 
+	slog.Info("AggAnalysis request", "rule_ids", ids, "start_ts", startTS, "end_ts", endTS)
 	results, err := services.GetAggResults(ids, startTS, endTS)
 	if err != nil {
 		slog.Error("Failed to get agg results", "error", err)
@@ -131,8 +137,19 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 		return
 	}
 
-	startTS := c.Query("start_ts")
-	endTS := c.Query("end_ts")
+	// URL-decode timestamps: the frontend sends encodeURIComponent("YYYY-MM-DD HH:MM:SS")
+	// The Go backend's parseIST() expects "YYYY-MM-DD HH:MM:SS" (space-separated, IST naive).
+	startTSRaw, _ := url.QueryUnescape(c.Query("start_ts"))
+	endTSRaw, _ := url.QueryUnescape(c.Query("end_ts"))
+	startTS := strings.TrimSpace(startTSRaw)
+	endTS := strings.TrimSpace(endTSRaw)
+
+	if startTS == "" || endTS == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "start_ts and end_ts are required query parameters"})
+		return
+	}
+
+	slog.Info("HistoricalAnalysis request", "start_ts", startTS, "end_ts", endTS)
 
 	// Convert rule to map[string]interface{} for DuckDB worker
 	ruleJSON, err := json.Marshal(rule)
