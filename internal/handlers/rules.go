@@ -39,13 +39,31 @@ func (h *RulesHandler) ReadRoot(c *gin.Context) {
 	})
 }
 
-// Health handles GET /health
+// Health handles GET /health (liveness probe — is the process alive?)
 func (h *RulesHandler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "healthy",
 		"live_store":     h.liveStore.Stats(),
 		"ws_connections": h.wsManager.ConnectionCount(),
 	})
+}
+
+// Readyz handles GET /readyz (readiness probe — are all dependencies available?)
+// Returns 200 only when ClickHouse is reachable. Returns 503 otherwise.
+func (h *RulesHandler) Readyz(c *gin.Context) {
+	ready, reason := services.IsReady()
+	if ready {
+		c.JSON(http.StatusOK, gin.H{
+			"status":     "ready",
+			"clickhouse": "ok",
+			"live_store": h.liveStore.Stats(),
+		})
+	} else {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "not_ready",
+			"reason": reason,
+		})
+	}
 }
 
 // CreateRule handles POST /rules

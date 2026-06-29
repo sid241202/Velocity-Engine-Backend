@@ -11,11 +11,12 @@ import (
 
 // LiveStore is a thread-safe in-memory rolling store for live rule results.
 type LiveStore struct {
-	mu        sync.RWMutex
-	data      map[string][]map[string]interface{} // ruleId -> rows
-	totalRows int
-	maxRows   int
-	hours     int
+	mu          sync.RWMutex
+	data        map[string][]map[string]interface{} // ruleId -> rows
+	totalRows   int
+	droppedRows int64 // cumulative count of rows dropped due to capacity cap
+	maxRows     int
+	hours       int
 }
 
 // NewLiveStore creates a new LiveStore with configured limits.
@@ -73,13 +74,14 @@ func (s *LiveStore) GetAll(ruleIDs []string) map[string][]map[string]interface{}
 	return result
 }
 
-// Stats returns current store statistics.
+// Stats returns current store statistics including dropped-rows counter.
 func (s *LiveStore) Stats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return map[string]interface{}{
-		"total_rows": s.totalRows,
-		"rule_count": len(s.data),
+		"total_rows":   s.totalRows,
+		"rule_count":   len(s.data),
+		"dropped_rows": s.droppedRows,
 	}
 }
 
@@ -135,6 +137,7 @@ func (s *LiveStore) pruneIfNeeded() {
 			copy(newRows, old[toRemove:])
 			s.data[largestRID] = newRows
 			s.totalRows -= toRemove
+			s.droppedRows += int64(toRemove)
 			excess -= toRemove
 			if len(s.data[largestRID]) == 0 {
 				delete(s.data, largestRID)

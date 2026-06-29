@@ -113,6 +113,7 @@ func main() {
 	// Root & health
 	router.GET("/", rulesHandler.ReadRoot)
 	router.GET("/health", rulesHandler.Health)
+	router.GET("/readyz", rulesHandler.Readyz)
 
 	// Static paths BEFORE parameterized routes to avoid conflicts
 	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)

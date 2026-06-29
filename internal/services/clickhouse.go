@@ -83,26 +83,28 @@ func rowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
 			val := values[i]
 
 			// Convert time.Time to string
-			switch v := val.(type) {
-			case time.Time:
-				if col == "windowStart" || col == "windowEnd" || col == "evaluatedAt" {
-					row[col] = v.Format("2006-01-02 15:04:05.000")
-				} else {
-					row[col] = v.Format("2006-01-02 15:04:05.000")
-				}
-			case *time.Time:
-				if v != nil {
-					row[col] = v.Format("2006-01-02 15:04:05.000")
+			if t, ok := val.(time.Time); ok {
+				row[col] = t.Format("2006-01-02 15:04:05.000")
+			} else if t, ok := val.(*time.Time); ok {
+				if t != nil {
+					row[col] = t.Format("2006-01-02 15:04:05.000")
 				} else {
 					row[col] = nil
 				}
-			default:
+			} else {
 				row[col] = val
 			}
 		}
 
-		// Parse aggregationResults if it's a string
-		if aggStr, ok := row["aggregationResults"].(string); ok {
+		// Parse aggResult (new schema) — stored as a JSON string in ClickHouse, expand for frontend
+		if aggStr, ok := row["aggResult"].(string); ok && aggStr != "" {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(aggStr), &parsed); err == nil {
+				row["aggResult"] = parsed
+			}
+		}
+		// Backward-compat: old schema used aggregationResults
+		if aggStr, ok := row["aggregationResults"].(string); ok && aggStr != "" {
 			var parsed interface{}
 			if err := json.Unmarshal([]byte(aggStr), &parsed); err == nil {
 				row["aggregationResults"] = parsed
@@ -254,6 +256,19 @@ func CloseClickHouse() {
 			slog.Info("ClickHouse connection closed")
 		}
 	}
+}
+
+// IsReady checks whether all critical dependencies are reachable.
+// Returns (true, "") if ready, or (false, reason) if not.
+func IsReady() (bool, string) {
+	db, err := getClickHouseDB()
+	if err != nil {
+		return false, fmt.Sprintf("clickhouse unavailable: %s", err.Error())
+	}
+	if err := db.Ping(); err != nil {
+		return false, fmt.Sprintf("clickhouse ping failed: %s", err.Error())
+	}
+	return true, ""
 }
 
 // placeholders generates a comma-separated list of ? placeholders.
