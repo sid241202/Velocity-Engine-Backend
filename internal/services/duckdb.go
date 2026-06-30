@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -408,8 +409,62 @@ func ParseHavingExpression(expr string, validAliases map[string]bool) (string, e
 	return cleaned, nil
 }
 
+// ─── DuckDB Singleton ────────────────────────────────────────────────────────
+// A single persistent DuckDB connection is shared across all historical-analysis
+// requests. This avoids the ~5–15 s overhead of re-installing and re-loading the
+// iceberg + httpfs extensions on every HTTP call.
+//
+// All callers must hold duckDBMu for the entire S3-config + query sequence because
+// DuckDB SET variables are connection-global and we enforce MaxOpenConns(1).
+
+var (
+	duckDBMu        sync.Mutex
+	duckDBSingleton *sql.DB
+)
+
+// initDuckDB returns the shared DuckDB connection, creating it on the first call.
+// It tries LOAD first (fast: uses the local extension cache) and falls back to
+// INSTALL + LOAD on a cold start or missing cache (e.g., a fresh container).
+func initDuckDB() (*sql.DB, error) {
+	duckDBMu.Lock()
+	defer duckDBMu.Unlock()
+
+	if duckDBSingleton != nil {
+		return duckDBSingleton, nil
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
+	}
+	// One connection only: DuckDB in-memory + global SET vars are not safe across
+	// concurrent sessions.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	for _, ext := range []string{"iceberg", "httpfs"} {
+		if _, loadErr := db.Exec("LOAD " + ext); loadErr != nil {
+			slog.Info("DuckDB extension not in cache — installing", "ext", ext)
+			if _, instErr := db.Exec("INSTALL " + ext); instErr != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("failed to install DuckDB extension %q: %w", ext, instErr)
+			}
+			if _, loadErr2 := db.Exec("LOAD " + ext); loadErr2 != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("failed to load DuckDB extension %q after install: %w", ext, loadErr2)
+			}
+		}
+		slog.Info("DuckDB extension ready", "ext", ext)
+	}
+
+	duckDBSingleton = db
+	slog.Info("DuckDB singleton initialized — extensions loaded once for process lifetime")
+	return duckDBSingleton, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // RunHistoricalAnalysis executes a historical analysis using DuckDB on Iceberg data.
-// This replicates the Python duckdb_worker.run_historical_analysis function exactly.
 func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
 	// IST timezone: UTC+5:30
 	ist := time.FixedZone("IST", 5*60*60+30*60)
@@ -441,24 +496,17 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
        startDt = endDt.Add(-7 * 24 * time.Hour)
     }
 
-	// Open in-memory DuckDB connection
-	db, err := sql.Open("duckdb", "")
+	// Get (or lazily initialize) the shared DuckDB connection.
+	// Extensions are loaded once per process — no per-request install overhead.
+	db, err := initDuckDB()
 	if err != nil {
-		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
+		return nil, fmt.Errorf("DuckDB initialization failed: %w", err)
 	}
-	defer db.Close()
 
-	// Install and load extensions
-	for _, stmt := range []string{
-		"INSTALL iceberg",
-		"LOAD iceberg",
-		"INSTALL httpfs",
-		"LOAD httpfs",
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return nil, fmt.Errorf("failed to execute '%s': %w", stmt, err)
-		}
-	}
+	// Hold the mutex for the entire S3-config + query sequence.
+	// initDuckDB released it above; we re-acquire here to serialize requests.
+	duckDBMu.Lock()
+	defer duckDBMu.Unlock()
 
 	// Configure S3
 	s3Endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "http://"), "https://")
@@ -624,8 +672,15 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 		thresholdMetCol = ", false as threshold_met"
 	}
 
-	startStr := startDt.Format("2006-01-02 15:04:05")
-    endStr := endDt.Format("2006-01-02 15:04:05")
+	// ── CRITICAL: convert IST → UTC before binding to DuckDB ─────────────────
+	// DuckDB's try_cast(? AS TIMESTAMP) treats bound string literals as UTC.
+	// The Iceberg event_timestamp column is also stored in UTC.
+	// If we pass IST-formatted strings (e.g. "10:00:00") DuckDB reads them as
+	// UTC, shifting the query window by +5h30m and returning wrong data.
+	// Converting to UTC here means "10:00 IST" → "04:30 UTC" in the query,
+	// which correctly filters rows whose event_timestamp is 10:00–11:00 IST.
+	startStr := startDt.UTC().Format("2006-01-02 15:04:05")
+	endStr := endDt.UTC().Format("2006-01-02 15:04:05")
 
 	query := fmt.Sprintf(`
         SELECT
@@ -639,10 +694,10 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
         %s
         %s
         ORDER BY window_start DESC
-        LIMIT 1000
+        LIMIT 5000
         `, sizeSeconds, windowField, selectKeys, aggClause, thresholdMetCol, icebergSource,
-           windowField, windowField, whereClause, groupByClause,
-        )
+		   windowField, windowField, whereClause, groupByClause,
+	)
 
 	// Build params: time range first, then filter params
 	allParams := make([]interface{}, 0, 2+len(filterParams))
@@ -650,8 +705,10 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 	allParams = append(allParams, filterParams...)
 
 	slog.Info("Executing DuckDB historical analysis",
-		"start", startStr,
-		"end", endStr,
+		"start_ist", startDt.Format("2006-01-02 15:04:05 IST"),
+		"end_ist", endDt.Format("2006-01-02 15:04:05 IST"),
+		"start_utc", startStr,
+		"end_utc", endStr,
 		"window_seconds", sizeSeconds,
 	)
 	slog.Debug("DuckDB query", "query", query, "params", allParams)
