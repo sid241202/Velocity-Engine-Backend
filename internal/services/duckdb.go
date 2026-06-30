@@ -531,8 +531,34 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 		}
 	}
 
-	// Build the Iceberg scan source expression
-	icebergSource := fmt.Sprintf("iceberg_scan('%s')", config.IcebergS3Path)
+	// ─── DYNAMIC ICEBERG METADATA DISCOVERY ───────────────────────────────────
+    // Because Flink and Spark use a HiveCatalog, they do not write version-hint.text to S3.
+    // We use DuckDB's glob() to dynamically find the latest .metadata.json file instead.
+    basePath := strings.TrimRight(config.IcebergS3Path, "/")
+    metadataGlob := fmt.Sprintf("%s/metadata/*.metadata.json", basePath)
+
+    // This regex extracts the version number (e.g., '45' from '00045-uuid.metadata.json')
+    // and sorts them in descending order to grab the absolute latest snapshot.
+    findMetadataQuery := fmt.Sprintf(`
+        SELECT file
+        FROM glob('%s')
+        ORDER BY try_cast(regexp_extract(file, '([0-9]+)[^/]*\.metadata\.json', 1) AS BIGINT) DESC NULLS LAST
+        LIMIT 1
+    `, metadataGlob)
+
+    var latestMetadataJSON string
+    if err := db.QueryRow(findMetadataQuery).Scan(&latestMetadataJSON); err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("no Iceberg metadata files found in: %s", metadataGlob)
+        }
+        return nil, fmt.Errorf("failed to discover latest Iceberg metadata JSON: %w", err)
+    }
+
+    slog.Info("Discovered latest Iceberg metadata (HiveCatalog bypass)", "file", latestMetadataJSON)
+
+    // Build the Iceberg scan source expression pointing directly to the JSON file
+    icebergSource := fmt.Sprintf("iceberg_scan('%s')", latestMetadataJSON)
+    // ──────────────────────────────────────────────────────────────────────────
 
 	// Build the query dynamically based on the rule
 	grouping, _ := ruleDict["grouping"].(map[string]interface{})
