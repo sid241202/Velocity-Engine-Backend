@@ -537,7 +537,7 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
     basePath := strings.TrimRight(config.IcebergS3Path, "/")
 
     // Target the specific day partition
-    parquetGlob := fmt.Sprintf("%s/data/event_timestamp_day=%s/*/*.parquet", basePath, partitionDate)
+    parquetGlob := fmt.Sprintf("%s/data/event_timestamp_day=%s/*.parquet", basePath, partitionDate)
 
     slog.Info("Scanning raw Parquet files by partition", "glob", parquetGlob)
 
