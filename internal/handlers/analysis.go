@@ -116,11 +116,22 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 		}
 	}
 
+	// Input validation: require at least one rule ID and valid time range
+	if len(ids) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Please select at least one rule to analyze."})
+		return
+	}
+	if startTS == "" || endTS == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Start and end timestamps are required."})
+		return
+	}
+
 	slog.Info("AggAnalysis request", "rule_ids", ids, "start_ts", startTS, "end_ts", endTS)
 	results, err := services.GetAggResults(ids, startTS, endTS)
 	if err != nil {
 		slog.Error("Failed to get agg results", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		// Return user-friendly message — real error is already logged above
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to query aggregated analytics. Please try again or contact support."})
 		return
 	}
 
