@@ -532,33 +532,73 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 	}
 
 	// ─── DYNAMIC ICEBERG METADATA DISCOVERY ───────────────────────────────────
-    // Because Flink and Spark use a HiveCatalog, they do not write version-hint.text to S3.
-    // We use DuckDB's glob() to dynamically find the latest .metadata.json file instead.
-    basePath := strings.TrimRight(config.IcebergS3Path, "/")
-    metadataGlob := fmt.Sprintf("%s/metadata/*.metadata.json", basePath)
+        basePath := strings.TrimRight(config.IcebergS3Path, "/")
+        metadataGlob := fmt.Sprintf("%s/metadata/*.metadata.json", basePath)
 
-    // This regex extracts the version number (e.g., '45' from '00045-uuid.metadata.json')
-    // and sorts them in descending order to grab the absolute latest snapshot.
-    findMetadataQuery := fmt.Sprintf(`
-        SELECT file
-        FROM glob('%s')
-        ORDER BY try_cast(regexp_extract(file, '([0-9]+)[^/]*\.metadata\.json', 1) AS BIGINT) DESC NULLS LAST
-        LIMIT 1
-    `, metadataGlob)
+        findMetadataQuery := fmt.Sprintf(`
+            SELECT file
+            FROM glob('%s')
+            ORDER BY try_cast(regexp_extract(file, '([0-9]+)[^/]*\.metadata\.json', 1) AS BIGINT) DESC NULLS LAST
+            LIMIT 1
+        `, metadataGlob)
 
-    var latestMetadataJSON string
-    if err := db.QueryRow(findMetadataQuery).Scan(&latestMetadataJSON); err != nil {
-        if err == sql.ErrNoRows {
-            return nil, fmt.Errorf("no Iceberg metadata files found in: %s", metadataGlob)
+        var latestMetadataJSON string
+        if err := db.QueryRow(findMetadataQuery).Scan(&latestMetadataJSON); err != nil {
+            if err == sql.ErrNoRows {
+                return nil, fmt.Errorf("no Iceberg metadata files found in: %s", metadataGlob)
+            }
+            return nil, fmt.Errorf("failed to discover latest Iceberg metadata JSON: %w", err)
         }
-        return nil, fmt.Errorf("failed to discover latest Iceberg metadata JSON: %w", err)
-    }
 
-    slog.Info("Discovered latest Iceberg metadata (HiveCatalog bypass)", "file", latestMetadataJSON)
+        slog.Info("Discovered latest Iceberg metadata", "file", latestMetadataJSON)
 
-    // Build the Iceberg scan source expression pointing directly to the JSON file
-    icebergSource := fmt.Sprintf("iceberg_scan('%s')", latestMetadataJSON)
-    // ──────────────────────────────────────────────────────────────────────────
+        // ─── BYPASS DUCKDB EQUALITY DELETE BUG ────────────────────────────────────
+        // DuckDB v1.1.3 crashes with "Binder Error: Table 'iceberg_scan_deletes'..."
+        // when Flink writes Iceberg V2 Equality Deletes via upsert=true.
+        // We bypass native iceberg_scan, extract the active data files, and read them via read_parquet.
+
+        // Content '0'/'DATA' fetches DATA files. Status '0'/'1' ignores logically removed files.
+        findFilesQuery := fmt.Sprintf(`
+            SELECT file_path
+            FROM iceberg_metadata('%s')
+            WHERE CAST(content AS VARCHAR) IN ('0', 'DATA')
+              AND CAST(status AS VARCHAR) IN ('0', '1', 'EXISTING', 'ADDED')
+        `, latestMetadataJSON)
+
+        fileRows, err := db.Query(findFilesQuery)
+        if err != nil {
+            return nil, fmt.Errorf("failed to extract data files from Iceberg metadata: %w", err)
+        }
+        defer fileRows.Close()
+
+        var filePaths []string
+        for fileRows.Next() {
+            var fp string
+            if err := fileRows.Scan(&fp); err == nil {
+                // Replace s3a:// with s3:// transparently in case Flink uses Hadoop S3A
+                fp = strings.Replace(fp, "s3a://", "s3://", 1)
+                filePaths = append(filePaths, fmt.Sprintf("'%s'", strings.ReplaceAll(fp, "'", "''")))
+            }
+        }
+        if err := fileRows.Err(); err != nil {
+            return nil, fmt.Errorf("error reading data files: %w", err)
+        }
+
+        if len(filePaths) == 0 {
+            slog.Info("No data files found in the Iceberg table snapshot")
+            return []map[string]interface{}{}, nil
+        }
+
+        slog.Info("Extracted live Iceberg data files to bypass Equality Deletes", "file_count", len(filePaths))
+
+        // Reconstruct Flink's upsert logic dynamically using DuckDB's QUALIFY row_number().
+        // Flink's equality fields are event_timestamp and authCode.
+        // We pick the latest event arriving from Kafka using input_kafka_timestamp.
+        icebergSource := fmt.Sprintf(`(
+            SELECT * FROM read_parquet([%s], union_by_name=true)
+            QUALIFY row_number() OVER (PARTITION BY event_timestamp, authCode ORDER BY input_kafka_timestamp DESC NULLS LAST) = 1
+        ) AS bypass_equality_deletes`, strings.Join(filePaths, ", "))
+        // ──────────────────────────────────────────────────────────────────────────
 
 	// Build the query dynamically based on the rule
 	grouping, _ := ruleDict["grouping"].(map[string]interface{})
