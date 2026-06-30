@@ -82,7 +82,7 @@ func main() {
 
 	// Create handlers
 	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager, csvStore)
-	analysisHandler := handlers.NewAnalysisHandler(liveStore)
+	analysisHandler := handlers.NewAnalysisHandler(liveStore, anomalyStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
 
 	// Setup Gin router
@@ -133,6 +133,7 @@ func main() {
 	// Static paths BEFORE parameterized routes to avoid conflicts
 	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)
 	router.GET("/rules/agg-analysis", analysisHandler.AggAnalysis)
+	router.GET("/rules/anomaly-analysis", analysisHandler.AnomalyAnalysis)
 	router.POST("/rules/historical-test", analysisHandler.HistoricalTest)
 	router.POST("/rules/historical-analysis", analysisHandler.HistoricalAnalysis)
 

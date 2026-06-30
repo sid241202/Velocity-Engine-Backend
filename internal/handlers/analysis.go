@@ -18,12 +18,13 @@ import (
 
 // AnalysisHandler handles live-analysis, agg-analysis, historical-test, and historical-analysis endpoints.
 type AnalysisHandler struct {
-	liveStore *services.LiveStore
+	liveStore    *services.LiveStore
+	anomalyStore *services.AnomalyStore
 }
 
 // NewAnalysisHandler creates a new AnalysisHandler.
-func NewAnalysisHandler(ls *services.LiveStore) *AnalysisHandler {
-	return &AnalysisHandler{liveStore: ls}
+func NewAnalysisHandler(ls *services.LiveStore, as *services.AnomalyStore) *AnalysisHandler {
+	return &AnalysisHandler{liveStore: ls, anomalyStore: as}
 }
 
 // LiveAnalysis handles GET /rules/live-analysis
@@ -49,7 +50,55 @@ func (h *AnalysisHandler) LiveAnalysis(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
-// AggAnalysis handles GET /rules/agg-analysis
+// AnomalyAnalysis handles GET /rules/anomaly-analysis
+// Returns recent anomaly events from the in-memory ring buffer (fed from Kafka anomaly topic).
+// Query params:
+//   - rule_ids: comma-separated list of rule IDs to filter by (empty = all)
+//   - limit:    max number of anomaly events to return (default 100, max 500)
+func (h *AnalysisHandler) AnomalyAnalysis(c *gin.Context) {
+	ruleIDsParam := c.Query("rule_ids")
+	limitStr := c.DefaultQuery("limit", "100")
+
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	var ids []string
+	for _, r := range strings.Split(ruleIDsParam, ",") {
+		trimmed := strings.TrimSpace(r)
+		if trimmed != "" {
+			ids = append(ids, trimmed)
+		}
+	}
+
+	if h.anomalyStore == nil {
+		c.JSON(http.StatusOK, gin.H{"results": []interface{}{}, "count": 0})
+		return
+	}
+
+	var result []map[string]interface{}
+	if len(ids) == 0 {
+		result = h.anomalyStore.GetRecent("", limit)
+	} else {
+		for _, id := range ids {
+			events := h.anomalyStore.GetRecent(id, limit)
+			result = append(result, events...)
+		}
+	}
+
+	if result == nil {
+		result = []map[string]interface{}{}
+	}
+
+	slog.Info("AnomalyAnalysis request", "rule_ids", ids, "limit", limit, "returned", len(result))
+	c.JSON(http.StatusOK, gin.H{
+		"results": result,
+		"count":   len(result),
+	})
+}
+
+
 func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	ruleIDsParam := c.Query("rule_ids")
 	// URL-decode timestamps: the frontend sends encodeURIComponent("YYYY-MM-DD HH:MM:SS")
