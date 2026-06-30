@@ -46,6 +46,8 @@ RUN mkdir -p /home/uidapp/.duckdb/extensions/v1.1.3/linux_amd64
 COPY --chown=uidapp:uidapp duckdb-ext/iceberg.duckdb_extension /home/uidapp/.duckdb/extensions/v1.1.3/linux_amd64/
 COPY --chown=uidapp:uidapp duckdb-ext/httpfs.duckdb_extension /home/uidapp/.duckdb/extensions/v1.1.3/linux_amd64/
 
+RUN mkdir -p /tmp/duckdb && chown uidapp:uidapp /tmp/duckdb
+
 COPY --from=build /SCA-bom.json .
 COPY --from=build /app/velocity-engine-backend .
 EXPOSE 8000
