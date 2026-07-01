@@ -155,14 +155,16 @@ func main() {
 	router.GET("/ws/anomaly-analysis", wsHandler.AnomalyAnalysisWS)
 
 	// Create HTTP server
+	// WriteTimeout is set to 15 min to support long-running DuckDB historical analysis queries
+	// and ClickHouse aggregation scans. This matches the nginx proxy_read_timeout on the frontend.
 	addr := fmt.Sprintf("%s:%s", config.ServerHost, config.ServerPort)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           router,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       15 * time.Minute,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		WriteTimeout:      15 * time.Minute,
+		IdleTimeout:       5 * time.Minute,
 	}
 
 	// Start server in goroutine
