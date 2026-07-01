@@ -86,7 +86,7 @@ func (h *WSHandler) LiveResultsWS(c *gin.Context) {
 			slog.Info("Client disconnected from live-results", "rule_id", ruleID)
 			return
 		case <-ticker.C:
-			results, err := services.GetLiveResults(ruleID, 100)
+			results, err := services.GetLiveResults(c.Request.Context(), ruleID, 100)
 			if err != nil {
 				slog.Error("Failed to get live results for WebSocket", "rule_id", ruleID, "error", err)
 				continue

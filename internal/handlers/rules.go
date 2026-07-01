@@ -376,7 +376,7 @@ func (h *RulesHandler) LiveResults(c *gin.Context) {
 		limit = 100
 	}
 
-	results, err := services.GetLiveResults(ruleID, limit)
+	results, err := services.GetLiveResults(c.Request.Context(), ruleID, limit)
 	if err != nil {
 		slog.Error("Failed to get live results", "rule_id", ruleID, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
