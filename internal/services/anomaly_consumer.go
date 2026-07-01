@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
@@ -15,20 +16,18 @@ import (
 // AnomalyStore holds a bounded ring-buffer of recent anomaly events in memory.
 // It is written by AnomalyConsumer and read by the anomaly WebSocket handler.
 type AnomalyStore struct {
-	mu     chan struct{}
+	mu     sync.RWMutex
 	events []map[string]interface{}
 	maxLen int
 }
 
 func NewAnomalyStore(maxLen int) *AnomalyStore {
-	mu := make(chan struct{}, 1)
-	mu <- struct{}{}
-	return &AnomalyStore{mu: mu, events: make([]map[string]interface{}, 0, maxLen), maxLen: maxLen}
+	return &AnomalyStore{events: make([]map[string]interface{}, 0, min(maxLen, 1000)), maxLen: maxLen}
 }
 
 func (as *AnomalyStore) Add(event map[string]interface{}) {
-	<-as.mu
-	defer func() { as.mu <- struct{}{} }()
+	as.mu.Lock()
+	defer as.mu.Unlock()
 	as.events = append(as.events, event)
 	if len(as.events) > as.maxLen {
 		// Copy to a new slice to release the old backing array
@@ -40,8 +39,8 @@ func (as *AnomalyStore) Add(event map[string]interface{}) {
 
 // GetRecent returns up to n most-recent anomaly events, optionally filtered by ruleID (empty = all).
 func (as *AnomalyStore) GetRecent(ruleID string, n int) []map[string]interface{} {
-	<-as.mu
-	defer func() { as.mu <- struct{}{} }()
+	as.mu.RLock()
+	defer as.mu.RUnlock()
 	var result []map[string]interface{}
 	for i := len(as.events) - 1; i >= 0 && len(result) < n; i-- {
 		evt := as.events[i]
@@ -95,9 +94,15 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 		default:
 		}
 
-		// Use hostname-appended group ID so each pod gets ALL messages (broadcast pattern).
-		hostname, _ := os.Hostname()
-		groupID := config.AnomalyConsumerGroup + "-" + hostname
+		// Use POD_NAME (set by Kubernetes downward API) for a stable group ID per pod.
+		// This prevents stale consumer group accumulation on restarts.
+		podName := os.Getenv("POD_NAME")
+		if podName == "" {
+			hostname, _ := os.Hostname()
+			podName = hostname
+			slog.Warn("POD_NAME env var not set — using hostname for anomaly consumer group ID")
+		}
+		groupID := config.AnomalyConsumerGroup + "-" + podName
 
 		c, err := kafka.NewConsumer(&kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,

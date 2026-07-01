@@ -90,17 +90,24 @@ func PublishRule(ruleDict map[string]interface{}) bool {
 	}
 
 	e := <-deliveryChan
-	m := e.(*kafka.Message)
-	if m.TopicPartition.Error != nil {
-		slog.Error("Kafka delivery failed", "error", m.TopicPartition.Error)
+	switch ev := e.(type) {
+	case *kafka.Message:
+		if ev.TopicPartition.Error != nil {
+			slog.Error("Kafka delivery failed", "error", ev.TopicPartition.Error)
+			return false
+		}
+		slog.Info("Message delivered to Kafka",
+			"topic", *ev.TopicPartition.Topic,
+			"partition", ev.TopicPartition.Partition,
+		)
+		return true
+	case kafka.Error:
+		slog.Error("Kafka producer error on delivery", "code", ev.Code(), "error", ev)
+		return false
+	default:
+		slog.Error("Unexpected Kafka delivery event type", "event", e)
 		return false
 	}
-
-	slog.Info("Message delivered to Kafka",
-		"topic", *m.TopicPartition.Topic,
-		"partition", m.TopicPartition.Partition,
-	)
-	return true
 }
 
 // CloseProducer flushes and closes the Kafka producer.

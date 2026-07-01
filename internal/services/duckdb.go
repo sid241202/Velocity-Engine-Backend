@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -434,10 +435,18 @@ func initDuckDB() (*sql.DB, error) {
 	}
 
 	db, err := sql.Open("duckdb", "")
-	_, err = db.Exec("SET memory_limit='600MB'")
-	_, err = db.Exec("SET temp_directory='/tmp/duckdb'")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
+	}
+
+	// Apply settings individually so we can detect which one fails.
+	if _, err = db.Exec("SET memory_limit='600MB'"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set DuckDB memory_limit: %w", err)
+	}
+	if _, err = db.Exec("SET temp_directory='/tmp/duckdb'"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to set DuckDB temp_directory: %w", err)
 	}
 	// One connection only: DuckDB in-memory + global SET vars are not safe across
 	// concurrent sessions.
@@ -467,7 +476,9 @@ func initDuckDB() (*sql.DB, error) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // RunHistoricalAnalysis executes a historical analysis using DuckDB on Iceberg data.
-func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
+// ctx is the request context — cancellation aborts the in-flight DuckDB query and
+// releases the global duckDBMu lock so subsequent requests are not starved.
+func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
 	// IST timezone: UTC+5:30
 	ist := time.FixedZone("IST", 5*60*60+30*60)
 
@@ -528,7 +539,7 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 		fmt.Sprintf("SET s3_use_ssl=%s", useSSL),
 	}
 	for _, stmt := range s3Stmts {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("failed to set S3 config") // DO NOT leak stmt in error
 		}
 	}
@@ -729,7 +740,9 @@ func RunHistoricalAnalysis(ruleDict map[string]interface{}, startTS, endTS strin
 	)
 	slog.Debug("DuckDB query", "query", query, "params", allParams)
 
-	rows, err := db.Query(query, allParams...)
+	// Use QueryContext so that if the HTTP client disconnects (AbortController on
+	// frontend), the context is cancelled and DuckDB releases the mutex promptly.
+	rows, err := db.QueryContext(ctx, query, allParams...)
 	if err != nil {
 		slog.Error("DuckDB query failed", "error", err)
 		return nil, fmt.Errorf("DuckDB query failed: %w", err)

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,48 +20,70 @@ import (
 var istZone = time.FixedZone("IST", 5*60*60+30*60)
 
 var (
-	chDB     *sql.DB
-	chDBOnce sync.Once
-	chDBErr  error
+	chDB    *sql.DB
+	chDBMu  sync.Mutex // guards chDB; unlike sync.Once, allows retry after failure
+	chDBErr error
 )
 
 // getClickHouseDB returns the singleton ClickHouse database connection.
+// Unlike sync.Once, this retries on failure so a transient startup failure
+// (e.g. ClickHouse not yet ready) does not permanently break the backend.
 func getClickHouseDB() (*sql.DB, error) {
-	chDBOnce.Do(func() {
-		if !regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(config.ClickHouseTable) {
-			slog.Error("Invalid ClickHouseTable config")
-			chDBErr = fmt.Errorf("invalid clickhouse table")
-			return
-		}
+	chDBMu.Lock()
+	defer chDBMu.Unlock()
 
-		db := clickhouse.OpenDB(&clickhouse.Options{
-			Addr: []string{fmt.Sprintf("%s:%d", config.ClickHouseHost, config.ClickHousePort)},
-			Auth: clickhouse.Auth{
-				Database: config.ClickHouseDB,
-				Username: config.ClickHouseUser,
-				Password: config.ClickHousePassword,
-			},
-			Protocol: clickhouse.HTTP,
-			DialTimeout: 10 * time.Second,
-			ReadTimeout: 30 * time.Second,
-		})
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(5)
-		db.SetConnMaxLifetime(5 * time.Minute)
+	if chDB != nil {
+		return chDB, nil
+	}
 
-		if err := db.Ping(); err != nil {
-			slog.Error("Failed to ping ClickHouse", "error", err)
-			chDBErr = err
-			return
-		}
-		chDB = db
-		slog.Info("ClickHouse client initialized",
-			"host", config.ClickHouseHost,
-			"port", config.ClickHousePort,
-			"db", config.ClickHouseDB,
-		)
+	if !regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`).MatchString(config.ClickHouseTable) {
+		chDBErr = fmt.Errorf("invalid clickhouse table name")
+		slog.Error("Invalid ClickHouseTable config")
+		return nil, chDBErr
+	}
+
+	db := clickhouse.OpenDB(&clickhouse.Options{
+		Addr: []string{fmt.Sprintf("%s:%d", config.ClickHouseHost, config.ClickHousePort)},
+		Auth: clickhouse.Auth{
+			Database: config.ClickHouseDB,
+			Username: config.ClickHouseUser,
+			Password: config.ClickHousePassword,
+		},
+		Protocol:    clickhouse.HTTP,
+		DialTimeout: 10 * time.Second,
+		ReadTimeout: 120 * time.Second, // Increased from 30s — heavy agg scans over 24h can take >30s
 	})
-	return chDB, chDBErr
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute) // proactively recycle idle conns before server kills them
+
+	if err := db.Ping(); err != nil {
+		slog.Error("Failed to ping ClickHouse — will retry on next request", "error", err)
+		chDBErr = err
+		return nil, err
+	}
+
+	chDB = db
+	chDBErr = nil
+	slog.Info("ClickHouse client initialized",
+		"host", config.ClickHouseHost,
+		"port", config.ClickHousePort,
+		"db", config.ClickHouseDB,
+	)
+	return chDB, nil
+}
+
+// ResetClickHouseConn forces a reconnect attempt on the next request.
+// Called after a ping failure so the readiness probe can recover.
+func ResetClickHouseConn() {
+	chDBMu.Lock()
+	defer chDBMu.Unlock()
+	if chDB != nil {
+		_ = chDB.Close()
+	}
+	chDB = nil
+	chDBErr = nil
 }
 
 // rowsToMaps converts sql.Rows into a slice of map[string]interface{},
@@ -127,7 +150,7 @@ func rowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
 }
 
 // GetLiveResults fetches the latest rule results from ClickHouse for a single rule.
-func GetLiveResults(ruleID string, limit int) ([]map[string]interface{}, error) {
+func GetLiveResults(ctx context.Context, ruleID string, limit int) ([]map[string]interface{}, error) {
 	db, err := getClickHouseDB()
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse not available: %w", err)
@@ -138,8 +161,10 @@ func GetLiveResults(ruleID string, limit int) ([]map[string]interface{}, error) 
 		ORDER BY windowStart DESC
 		LIMIT ?`, config.ClickHouseTable)
 
-	rows, err := db.Query(query, ruleID, limit)
+	rows, err := db.QueryContext(ctx, query, ruleID, limit)
 	if err != nil {
+		// If the connection died, reset so next caller gets a fresh one
+		ResetClickHouseConn()
 		return nil, fmt.Errorf("clickhouse query failed: %w", err)
 	}
 	defer rows.Close()
@@ -206,7 +231,7 @@ func GetLiveResultsMulti(ruleIDs []string, hours int) (map[string][]map[string]i
 }
 
 // GetAggResults queries ClickHouse for aggregated results within an explicit time range.
-func GetAggResults(ruleIDs []string, startTS, endTS string) (map[string][]map[string]interface{}, error) {
+func GetAggResults(ctx context.Context, ruleIDs []string, startTS, endTS string) (map[string][]map[string]interface{}, error) {
 	if len(ruleIDs) == 0 {
 		return map[string][]map[string]interface{}{}, nil
 	}
@@ -229,7 +254,7 @@ func GetAggResults(ruleIDs []string, startTS, endTS string) (map[string][]map[st
 	}
 	args = append(args, startTS, endTS)
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse query failed: %w", err)
 	}
@@ -254,12 +279,15 @@ func GetAggResults(ruleIDs []string, startTS, endTS string) (map[string][]map[st
 
 // CloseClickHouse closes the ClickHouse connection pool.
 func CloseClickHouse() {
+	chDBMu.Lock()
+	defer chDBMu.Unlock()
 	if chDB != nil {
 		if err := chDB.Close(); err != nil {
 			slog.Error("Error closing ClickHouse", "error", err)
 		} else {
 			slog.Info("ClickHouse connection closed")
 		}
+		chDB = nil
 	}
 }
 
@@ -271,6 +299,8 @@ func IsReady() (bool, string) {
 		return false, fmt.Sprintf("clickhouse unavailable: %s", err.Error())
 	}
 	if err := db.Ping(); err != nil {
+		// Reset the connection so the next request re-tries
+		ResetClickHouseConn()
 		return false, fmt.Sprintf("clickhouse ping failed: %s", err.Error())
 	}
 	return true, ""

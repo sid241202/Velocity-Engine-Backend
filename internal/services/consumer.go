@@ -51,11 +51,16 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 		default:
 		}
 
-		// Use hostname-appended group ID so each pod gets ALL messages (broadcast pattern).
-		// With a static group ID, Kafka distributes partitions across pods — each sees only
-		// a subset of messages, which breaks LiveStore completeness and WebSocket broadcast.
-		hostname, _ := os.Hostname()
-		groupID := config.ResultsConsumerGroup + "-" + hostname
+		// Use POD_NAME (set by Kubernetes downward API) for a stable group ID per pod.
+		// This prevents stale consumer group accumulation on restarts.
+		// Fallback to hostname for non-Kubernetes environments.
+		podName := os.Getenv("POD_NAME")
+		if podName == "" {
+			hostname, _ := os.Hostname()
+			podName = hostname
+			slog.Warn("POD_NAME env var not set — using hostname for consumer group ID; set downward API in k8s deployment")
+		}
+		groupID := config.ResultsConsumerGroup + "-" + podName
 
 		c, err := kafka.NewConsumer(&kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,

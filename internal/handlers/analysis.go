@@ -127,7 +127,7 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	}
 
 	slog.Info("AggAnalysis request", "rule_ids", ids, "start_ts", startTS, "end_ts", endTS)
-	results, err := services.GetAggResults(ids, startTS, endTS)
+	results, err := services.GetAggResults(c.Request.Context(), ids, startTS, endTS)
 	if err != nil {
 		slog.Error("Failed to get agg results", "error", err)
 		// Return user-friendly message — real error is already logged above
@@ -173,6 +173,7 @@ func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 	}
 
 	results, err := services.RunHistoricalAnalysis(
+		c.Request.Context(),
 		ruleDict,
 		startDtNaive.Format("2006-01-02T15:04:05"),
 		endDtNaive.Format("2006-01-02T15:04:05"),
@@ -223,7 +224,7 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 		return
 	}
 
-	results, err := services.RunHistoricalAnalysis(ruleDict, startTS, endTS)
+	results, err := services.RunHistoricalAnalysis(c.Request.Context(), ruleDict, startTS, endTS)
 	if err != nil {
 		slog.Error("Historical analysis failed", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
