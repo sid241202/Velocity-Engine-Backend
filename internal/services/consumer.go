@@ -125,7 +125,8 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 		return
 	}
 
-	// New schema: aggResult is a pre-serialized JSON string — parse it for richer display
+	// ── Schema normalization ──────────────────────────────────────────────────
+	// New Flink schema: aggResult is a pre-serialized JSON string — parse it for richer display
 	if aggStr, ok := row["aggResult"].(string); ok {
 		var aggMap interface{}
 		if err := json.Unmarshal([]byte(aggStr), &aggMap); err == nil {
@@ -143,12 +144,43 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 	// Add event_type discriminator for frontend routing
 	row["event_type"] = "agg"
 
-	// Normalize: Flink AggregationResult uses "id" but downstream code (ClickHouse queries,
-	// LiveStore, WebSocket) expects "ruleId". Copy id → ruleId for consistency.
+	// Normalize: Flink AggregationResult uses "id" but downstream code expects "ruleId".
 	if id, ok := row["id"].(string); ok && id != "" {
 		if _, hasRuleId := row["ruleId"]; !hasRuleId {
 			row["ruleId"] = id
 		}
+	}
+
+	// Normalize groupKey: new schema sends "groupKey" field explicitly.
+	// Fall back to "entityValue" for backward compatibility with old Flink versions.
+	if _, hasGK := row["groupKey"]; !hasGK {
+		if ev, ok := row["entityValue"].(string); ok && ev != "" {
+			row["groupKey"] = ev
+		}
+	}
+
+	// Normalize windowStart / windowEnd from Flink schema to the field names
+	// the frontend and LiveStore expect.
+	if _, hasWS := row["windowStart"]; !hasWS {
+		if ws, ok := row["windowStart"]; ws != nil {
+			row["windowStart"] = ws
+		}
+	}
+
+	// ── thresholdBreached normalization ───────────────────────────────────────
+	// Flink serializes boolean as JSON true/false. The frontend's isBreached()
+	// checks for: row.thresholdBreached === true || row.thresholdBreached === 1.
+	// We ensure thresholdBreached is always present in the row sent to LiveStore
+	// and the WebSocket so the frontend can rely on it unconditionally.
+	//
+	// Jackson serializes Java boolean false as JSON false → Go JSON → bool false.
+	// Jackson serializes Java boolean true  as JSON true  → Go JSON → bool true.
+	// We keep it as-is; the frontend handles both bool and int (1/0).
+	if _, hasBreached := row["thresholdBreached"]; !hasBreached {
+		// Row predates the thresholdBreached field (old Flink version).
+		// Default to false — the frontend will show no breach for these rows
+		// which is correct since we cannot re-evaluate without the rule definition.
+		row["thresholdBreached"] = false
 	}
 
 	rc.liveStore.Add(row)
