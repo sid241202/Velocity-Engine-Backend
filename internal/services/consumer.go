@@ -162,7 +162,7 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 	// Normalize windowStart / windowEnd from Flink schema to the field names
 	// the frontend and LiveStore expect.
 	if _, hasWS := row["windowStart"]; !hasWS {
-		if ws, ok := row["windowStart"]; ws != nil {
+		if ws := row["windowStart"]; ws != nil {
 			row["windowStart"] = ws
 		}
 	}
