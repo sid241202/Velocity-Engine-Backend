@@ -183,6 +183,15 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 		row["thresholdBreached"] = false
 	}
 
+	// ── isFinal normalization ──────────────────────────────────────────────
+	// New Flink schema tags each row true (authoritative, end-of-window) or
+	// false (early-fire partial preview). Rows predating this field (old
+	// Flink version) are always the settled end-of-window row, so default
+	// to true rather than leaving the frontend to guess.
+	if _, hasFinal := row["isFinal"]; !hasFinal {
+		row["isFinal"] = true
+	}
+
 	rc.liveStore.Add(row)
 
 	// New schema uses "id" as rule identifier; old schema used "ruleId"

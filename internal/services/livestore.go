@@ -76,15 +76,33 @@ func (s *LiveStore) runPruner() {
 	}
 }
 
-// Add appends a single result row to the store.
+// Add appends or updates a single result row. Rows are upserted by
+// (ruleId, groupKey, windowStart): a Flink early-fire (partial) row and the
+// eventual final row for the same window share that key, so later ticks
+// replace the prior entry in place instead of piling up one row per partial
+// tick. Replacing in place never changes a row's windowStart, so it doesn't
+// disturb the chronological-prefix assumption pruneStale/trimExcess rely on.
 func (s *LiveStore) Add(row map[string]interface{}) {
 	ruleID, _ := row["ruleId"].(string)
 	if ruleID == "" {
 		ruleID = "unknown"
 	}
+	groupKey, _ := row["groupKey"].(string)
+	windowStart := fmt.Sprintf("%v", row["windowStart"])
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[ruleID] = append(s.data[ruleID], row)
+
+	rows := s.data[ruleID]
+	for i, existing := range rows {
+		eGroupKey, _ := existing["groupKey"].(string)
+		if eGroupKey == groupKey && fmt.Sprintf("%v", existing["windowStart"]) == windowStart {
+			rows[i] = row
+			return
+		}
+	}
+
+	s.data[ruleID] = append(rows, row)
 	s.totalRows++
 	// Only enforce the hard cap inline; time-based pruning is done by the background goroutine.
 	if s.totalRows > s.maxRows {

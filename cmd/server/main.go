@@ -150,7 +150,6 @@ func main() {
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 
 	// WebSocket routes
-	router.GET("/ws/live-results/:rule_id", wsHandler.LiveResultsWS)
 	router.GET("/ws/live-analysis", wsHandler.LiveAnalysisWS)
 	router.GET("/ws/anomaly-analysis", wsHandler.AnomalyAnalysisWS)
 

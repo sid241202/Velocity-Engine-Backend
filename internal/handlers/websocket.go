@@ -52,63 +52,6 @@ func NewWSHandler(ls *services.LiveStore, wm *services.WSManager, as *services.A
 	}
 }
 
-// LiveResultsWS handles WS /ws/live-results/:rule_id
-// On connect: accept, then loop every 1 second polling ClickHouse and sending JSON.
-func (h *WSHandler) LiveResultsWS(c *gin.Context) {
-	ruleID := c.Param("rule_id")
-
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		slog.Error("WebSocket upgrade failed", "error", err)
-		return
-	}
-	defer conn.Close()
-
-	slog.Info("WebSocket live-results connected", "rule_id", ruleID)
-
-	// Start a goroutine to read and discard messages (required for close detection)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			slog.Info("Client disconnected from live-results", "rule_id", ruleID)
-			return
-		case <-ticker.C:
-			results, err := services.GetLiveResults(c.Request.Context(), ruleID, 100)
-			if err != nil {
-				slog.Error("Failed to get live results for WebSocket", "rule_id", ruleID, "error", err)
-				continue
-			}
-
-			msg, err := json.Marshal(map[string]interface{}{
-				"rule_id": ruleID,
-				"results": results,
-			})
-			if err != nil {
-				slog.Error("Failed to marshal live results", "error", err)
-				continue
-			}
-
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				slog.Error("Failed to send live results", "rule_id", ruleID, "error", err)
-				return
-			}
-		}
-	}
-}
-
 // LiveAnalysisWS handles WS /ws/live-analysis
 // On connect: accept. Wait for subscribe message. Send bootstrap snapshot.
 // Then heartbeat at configured interval.
