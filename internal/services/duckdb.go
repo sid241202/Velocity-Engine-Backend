@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -466,80 +468,200 @@ func ParseHavingExpression(expr string, validAliases map[string]bool) (string, e
 	return cleaned, nil
 }
 
-// ─── DuckDB Singleton ────────────────────────────────────────────────────────
-// A single persistent DuckDB connection is shared across all historical-analysis
-// requests. This avoids the ~5–15 s overhead of re-installing and re-loading the
-// iceberg + httpfs extensions on every HTTP call.
+// ─── DuckDB engine ───────────────────────────────────────────────────────────
+// A single DuckDB *sql.Conn is pinned for the process lifetime and configured
+// exactly once (memory limit, temp dir, iceberg+httpfs extensions, S3 creds).
+// Pinning an explicit *sql.Conn — rather than relying on the pool to hand back
+// the same underlying connection — guarantees the per-connection SET state
+// (extensions, S3 config) is always present for every query, and means we never
+// pay the extension-load or S3-config cost per request.
 //
-// All callers must hold duckDBMu for the entire S3-config + query sequence because
-// DuckDB SET variables are connection-global and we enforce MaxOpenConns(1).
-
-var (
-	duckDBMu        sync.Mutex
-	duckDBSingleton *sql.DB
+// Concurrency is deliberately serialized through duckDBSem (capacity 1): a
+// *sql.Conn is not safe for concurrent use, and concurrent DuckDB+iceberg reads
+// on the pinned cgo build are not something we can validate in this environment,
+// so we do not risk wrong results by parallelizing. What IS made production-grade
+// here is the *backpressure*: acquireDuckDB fails fast (ErrHistoricalEngineBusy)
+// instead of letting requests pile up on an unbounded lock for the full 15-minute
+// HTTP write timeout, and every query runs under duckDBQueryTimeout so a runaway
+// scan can't wedge the single slot indefinitely.
+const (
+	// duckDBAcquireTimeout bounds how long a request waits for the single query
+	// slot before failing fast, so load sheds instead of exhausting goroutines.
+	duckDBAcquireTimeout = 30 * time.Second
+	// duckDBQueryTimeout bounds a single query's execution — a safety margin
+	// below the 15-minute HTTP write timeout so a stuck scan frees the slot.
+	duckDBQueryTimeout = 10 * time.Minute
 )
 
-// initDuckDB returns the shared DuckDB connection, creating it on the first call.
-// It tries LOAD first (fast: uses the local extension cache) and falls back to
-// INSTALL + LOAD on a cold start or missing cache (e.g., a fresh container).
-func initDuckDB() (*sql.DB, error) {
-	duckDBMu.Lock()
-	defer duckDBMu.Unlock()
+// ErrHistoricalEngineBusy is returned when the single DuckDB query slot is
+// occupied and does not free up within duckDBAcquireTimeout. Handlers should
+// surface this as 503 Service Unavailable (retryable), not 500.
+var ErrHistoricalEngineBusy = errors.New("historical query engine is at capacity; please retry shortly")
 
-	if duckDBSingleton != nil {
-		return duckDBSingleton, nil
+var (
+	duckDBInitMu sync.Mutex          // guards lazy creation / reset of the pinned conn
+	duckDBPool   *sql.DB             // underlying pool (MaxOpenConns 1)
+	duckDBConn   *sql.Conn           // the pinned, pre-configured connection
+	duckDBSem    = make(chan struct{}, 1) // serializes query execution with fail-fast acquire
+)
+
+// configureDuckDBConn applies the one-time per-connection setup: resource limits,
+// the iceberg + httpfs extensions (LOAD from cache, INSTALL+LOAD on cold start),
+// and S3 credentials. Run once when the connection is pinned.
+func configureDuckDBConn(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "SET memory_limit='600MB'"); err != nil {
+		return fmt.Errorf("failed to set DuckDB memory_limit: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SET temp_directory='/tmp/duckdb'"); err != nil {
+		return fmt.Errorf("failed to set DuckDB temp_directory: %w", err)
+	}
+	for _, ext := range []string{"iceberg", "httpfs"} {
+		if _, loadErr := conn.ExecContext(ctx, "LOAD "+ext); loadErr != nil {
+			slog.Info("DuckDB extension not in cache — installing", "ext", ext)
+			if _, instErr := conn.ExecContext(ctx, "INSTALL "+ext); instErr != nil {
+				return fmt.Errorf("failed to install DuckDB extension %q: %w", ext, instErr)
+			}
+			if _, loadErr2 := conn.ExecContext(ctx, "LOAD "+ext); loadErr2 != nil {
+				return fmt.Errorf("failed to load DuckDB extension %q after install: %w", ext, loadErr2)
+			}
+		}
+		slog.Info("DuckDB extension ready", "ext", ext)
+	}
+
+	// S3 credentials — set once here (previously re-applied on every request).
+	s3Endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "http://"), "https://")
+	safeAccessKey := strings.ReplaceAll(config.S3AccessKey, "'", "''")
+	safeSecretKey := strings.ReplaceAll(config.S3SecretKey, "'", "''")
+	useSSL := "true"
+	if strings.HasPrefix(config.S3Endpoint, "http://") {
+		useSSL = "false"
+	}
+	s3Stmts := []string{
+		fmt.Sprintf("SET s3_endpoint='%s'", s3Endpoint),
+		fmt.Sprintf("SET s3_access_key_id='%s'", safeAccessKey),
+		fmt.Sprintf("SET s3_secret_access_key='%s'", safeSecretKey),
+		"SET s3_url_style='path'",
+		fmt.Sprintf("SET s3_use_ssl=%s", useSSL),
+	}
+	for _, stmt := range s3Stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return errors.New("failed to set S3 config") // DO NOT leak stmt (contains creds)
+		}
+	}
+	return nil
+}
+
+// initDuckDB returns the pinned, pre-configured DuckDB connection, creating it
+// on first call (and after a reset). Guarded by duckDBInitMu.
+func initDuckDB(ctx context.Context) (*sql.Conn, error) {
+	duckDBInitMu.Lock()
+	defer duckDBInitMu.Unlock()
+
+	if duckDBConn != nil {
+		return duckDBConn, nil
 	}
 
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
 	}
-
-	// Apply settings individually so we can detect which one fails.
-	if _, err = db.Exec("SET memory_limit='600MB'"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to set DuckDB memory_limit: %w", err)
-	}
-	if _, err = db.Exec("SET temp_directory='/tmp/duckdb'"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to set DuckDB temp_directory: %w", err)
-	}
-	// One connection only: DuckDB in-memory + global SET vars are not safe across
-	// concurrent sessions.
+	// One underlying connection only: DuckDB in-memory + per-connection SET vars
+	// are not safe across concurrent sessions; we pin exactly one below.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	for _, ext := range []string{"iceberg", "httpfs"} {
-		if _, loadErr := db.Exec("LOAD " + ext); loadErr != nil {
-			slog.Info("DuckDB extension not in cache — installing", "ext", ext)
-			if _, instErr := db.Exec("INSTALL " + ext); instErr != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("failed to install DuckDB extension %q: %w", ext, instErr)
-			}
-			if _, loadErr2 := db.Exec("LOAD " + ext); loadErr2 != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("failed to load DuckDB extension %q after install: %w", ext, loadErr2)
-			}
-		}
-		slog.Info("DuckDB extension ready", "ext", ext)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to pin DuckDB connection: %w", err)
+	}
+	if cfgErr := configureDuckDBConn(ctx, conn); cfgErr != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, cfgErr
 	}
 
-	duckDBSingleton = db
-	slog.Info("DuckDB singleton initialized — extensions loaded once for process lifetime")
-	return duckDBSingleton, nil
+	duckDBPool = db
+	duckDBConn = conn
+	slog.Info("DuckDB connection pinned and configured — extensions + S3 set once for process lifetime")
+	return duckDBConn, nil
+}
+
+// resetDuckDB tears down the pinned connection and pool so the next initDuckDB
+// rebuilds them from scratch. Called when a query fails in a way that indicates
+// the connection itself is unusable (not merely a bad-SQL error), so a single
+// broken connection doesn't wedge the service for its whole lifetime.
+func resetDuckDB() {
+	duckDBInitMu.Lock()
+	defer duckDBInitMu.Unlock()
+	if duckDBConn != nil {
+		_ = duckDBConn.Close()
+		duckDBConn = nil
+	}
+	if duckDBPool != nil {
+		_ = duckDBPool.Close()
+		duckDBPool = nil
+	}
+	slog.Warn("DuckDB connection reset — will reinitialize on the next request")
+}
+
+// maybeResetOnFatal resets the pinned connection only for errors that mean the
+// connection is dead (driver.ErrBadConn / sql.ErrConnDone). A user's bad filter
+// or HAVING expression surfaces as an ordinary DuckDB query error and must NOT
+// nuke the shared connection.
+func maybeResetOnFatal(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		resetDuckDB()
+	}
+}
+
+// acquireDuckDB serializes query execution with fail-fast backpressure. It
+// returns a release func on success; on a full slot it waits up to
+// duckDBAcquireTimeout (or until ctx is cancelled) then returns
+// ErrHistoricalEngineBusy / ctx.Err() rather than blocking indefinitely.
+func acquireDuckDB(ctx context.Context) (func(), error) {
+	select {
+	case duckDBSem <- struct{}{}:
+		return func() { <-duckDBSem }, nil
+	default:
+	}
+	timer := time.NewTimer(duckDBAcquireTimeout)
+	defer timer.Stop()
+	select {
+	case duckDBSem <- struct{}{}:
+		return func() { <-duckDBSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrHistoricalEngineBusy
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// prepareIcebergQuery resolves the IST time range, initializes the shared
-// DuckDB connection, locks duckDBMu, configures S3, and builds the
-// iceberg_scan source — the setup shared by every historical query
-// (RunHistoricalAnalysis, RunHistoricalBreakdown). The mutex is held on
-// return; callers MUST defer the returned unlock() for the entire duration of
-// their query execution (matching the existing "hold duckDBMu for the whole
-// S3-config + query sequence" invariant), even though each caller only runs
-// its own query shape against the shared source.
-func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (db *sql.DB, icebergSource string, startStr string, endStr string, unlock func(), err error) {
+// icebergQuery bundles everything a historical query needs: the pinned DuckDB
+// connection, the shared iceberg_scan source subquery, the UTC-formatted time
+// bounds, the timeout-bounded context to run queries under, and a release func.
+// Callers MUST `defer q.release()` — it cancels the query timeout and frees the
+// single query slot.
+type icebergQuery struct {
+	conn          *sql.Conn
+	icebergSource string
+	startStr      string
+	endStr        string
+	ctx           context.Context
+	release       func()
+}
+
+// prepareIcebergQuery resolves the IST time range, acquires the single query
+// slot with fail-fast backpressure, ensures the pinned DuckDB connection is
+// ready, and builds the shared iceberg_scan source. S3/extensions are already
+// configured once on the pinned connection (see configureDuckDBConn), so this
+// no longer re-applies them per request.
+func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (*icebergQuery, error) {
 	parseIST := func(ts string) (time.Time, error) {
 		formatted := strings.Replace(ts, "T", " ", 1)
 		if len(formatted) == 16 {
@@ -549,10 +671,11 @@ func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (db *sql.DB
 	}
 
 	var endDt, startDt time.Time
+	var err error
 	if endTS != "" {
 		endDt, err = parseIST(endTS)
 		if err != nil {
-			return nil, "", "", "", nil, fmt.Errorf("invalid end_ts format: %w", err)
+			return nil, fmt.Errorf("invalid end_ts format: %w", err)
 		}
 	} else {
 		endDt = time.Now().In(istZone)
@@ -560,43 +683,23 @@ func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (db *sql.DB
 	if startTS != "" {
 		startDt, err = parseIST(startTS)
 		if err != nil {
-			return nil, "", "", "", nil, fmt.Errorf("invalid start_ts format: %w", err)
+			return nil, fmt.Errorf("invalid start_ts format: %w", err)
 		}
 	} else {
 		startDt = endDt.Add(-7 * 24 * time.Hour)
 	}
 
-	db, err = initDuckDB()
+	// Fail-fast acquire of the single query slot BEFORE touching DuckDB, so
+	// overload sheds here instead of piling up on connection setup.
+	release, err := acquireDuckDB(ctx)
 	if err != nil {
-		return nil, "", "", "", nil, fmt.Errorf("DuckDB initialization failed: %w", err)
+		return nil, err
 	}
 
-	// Hold the mutex for the entire S3-config + query sequence.
-	// initDuckDB released it above; we re-acquire here to serialize requests.
-	duckDBMu.Lock()
-	unlock = func() { duckDBMu.Unlock() }
-
-	s3Endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "http://"), "https://")
-	safeAccessKey := strings.ReplaceAll(config.S3AccessKey, "'", "''")
-	safeSecretKey := strings.ReplaceAll(config.S3SecretKey, "'", "''")
-
-	useSSL := "true"
-	if strings.HasPrefix(config.S3Endpoint, "http://") {
-		useSSL = "false"
-	}
-
-	s3Stmts := []string{
-		fmt.Sprintf("SET s3_endpoint='%s'", s3Endpoint),
-		fmt.Sprintf("SET s3_access_key_id='%s'", safeAccessKey),
-		fmt.Sprintf("SET s3_secret_access_key='%s'", safeSecretKey),
-		"SET s3_url_style='path'",
-		fmt.Sprintf("SET s3_use_ssl=%s", useSSL),
-	}
-	for _, stmt := range s3Stmts {
-		if _, execErr := db.ExecContext(ctx, stmt); execErr != nil {
-			unlock()
-			return nil, "", "", "", nil, fmt.Errorf("failed to set S3 config") // DO NOT leak stmt in error
-		}
+	conn, err := initDuckDB(ctx)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("DuckDB initialization failed: %w", err)
 	}
 
 	basePath := strings.TrimRight(config.IcebergS3Path, "/")
@@ -613,25 +716,37 @@ func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (db *sql.DB
 	// The QUALIFY dedup is kept as a defensive fallback on top of
 	// iceberg_scan's own delete handling until that's validated against
 	// production data — safe to remove once confirmed redundant.
-	icebergSource = fmt.Sprintf(`(
+	icebergSource := fmt.Sprintf(`(
         SELECT * FROM iceberg_scan('%s', allow_moved_paths => true)
         QUALIFY row_number() OVER (PARTITION BY event_timestamp, authCode ORDER BY input_kafka_timestamp DESC NULLS LAST) = 1
     ) AS stream_data`, basePath)
 
-	startStr = startDt.UTC().Format("2006-01-02 15:04:05")
-	endStr = endDt.UTC().Format("2006-01-02 15:04:05")
-	return db, icebergSource, startStr, endStr, unlock, nil
+	// Bound every query's execution; release() cancels this and frees the slot.
+	queryCtx, cancel := context.WithTimeout(ctx, duckDBQueryTimeout)
+	return &icebergQuery{
+		conn:          conn,
+		icebergSource: icebergSource,
+		startStr:      startDt.UTC().Format("2006-01-02 15:04:05"),
+		endStr:        endDt.UTC().Format("2006-01-02 15:04:05"),
+		ctx:           queryCtx,
+		release: func() {
+			cancel()
+			release()
+		},
+	}, nil
 }
 
 // RunHistoricalAnalysis executes a historical analysis using DuckDB on Iceberg data.
 // ctx is the request context — cancellation aborts the in-flight DuckDB query and
-// releases the global duckDBMu lock so subsequent requests are not starved.
+// frees the single query slot so subsequent requests are not starved. Returns
+// ErrHistoricalEngineBusy if the slot doesn't free up within the acquire window.
 func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
-	db, icebergSource, startStr, endStr, unlock, err := prepareIcebergQuery(ctx, startTS, endTS)
+	q, err := prepareIcebergQuery(ctx, startTS, endTS)
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer q.release()
+	icebergSource, startStr, endStr := q.icebergSource, q.startStr, q.endStr
 
 	// Build the query dynamically based on the rule
 	grouping, _ := ruleDict["grouping"].(map[string]interface{})
@@ -792,10 +907,11 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 	)
 	slog.Debug("DuckDB query", "query", query, "params", allParams)
 
-	// Use QueryContext so that if the HTTP client disconnects (AbortController on
-	// frontend), the context is cancelled and DuckDB releases the mutex promptly.
-	rows, err := db.QueryContext(ctx, query, allParams...)
+	// Run under q.ctx (bounded by duckDBQueryTimeout, and cancelled if the HTTP
+	// client disconnects) so a stuck scan can't hold the single query slot.
+	rows, err := q.conn.QueryContext(q.ctx, query, allParams...)
 	if err != nil {
+		maybeResetOnFatal(err)
 		slog.Error("DuckDB query failed", "error", err)
 		return nil, fmt.Errorf("DuckDB query failed: %w", err)
 	}
@@ -870,11 +986,12 @@ var modalityBreakdownCols = []struct{ Label, Col string }{
 // and a silent ordering mistake there would produce wrong breakdown numbers
 // with no visible error — a correctness risk not worth the saved DuckDB scans.
 func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) (map[string]interface{}, error) {
-	db, icebergSource, startStr, endStr, unlock, err := prepareIcebergQuery(ctx, startTS, endTS)
+	q, err := prepareIcebergQuery(ctx, startTS, endTS)
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer q.release()
+	icebergSource, startStr, endStr := q.icebergSource, q.startStr, q.endStr
 
 	var filterAST map[string]interface{}
 	if f, ok := ruleDict["filters"].(map[string]interface{}); ok {
@@ -897,8 +1014,9 @@ func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}
 	runCategoryBreakdown := func(labelExpr, extraWhere, orderLimit string) ([]map[string]interface{}, error) {
 		query := fmt.Sprintf(`SELECT %s AS label, COUNT(*) AS count FROM %s %s %s GROUP BY 1 %s`,
 			labelExpr, icebergSource, baseWhere, extraWhere, orderLimit)
-		rows, qErr := db.QueryContext(ctx, query, baseParams...)
+		rows, qErr := q.conn.QueryContext(q.ctx, query, baseParams...)
 		if qErr != nil {
+			maybeResetOnFatal(qErr)
 			return nil, qErr
 		}
 		defer rows.Close()
@@ -922,8 +1040,9 @@ func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}
 		modalitySelects = append(modalitySelects, fmt.Sprintf("CAST(COALESCE(SUM(%s),0) AS BIGINT) AS %s", m.Col, m.Col))
 	}
 	modalityQuery := fmt.Sprintf(`SELECT %s FROM %s %s`, strings.Join(modalitySelects, ", "), icebergSource, baseWhere)
-	modalityRows, err := db.QueryContext(ctx, modalityQuery, baseParams...)
+	modalityRows, err := q.conn.QueryContext(q.ctx, modalityQuery, baseParams...)
 	if err != nil {
+		maybeResetOnFatal(err)
 		return nil, fmt.Errorf("modality breakdown query failed: %w", err)
 	}
 	// Explicit Close() (not deferred) — MaxOpenConns(1) means this rows set
@@ -976,8 +1095,9 @@ func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}
 		) t
 		GROUP BY bucket_start
 		ORDER BY bucket_start`, icebergSource, baseWhere)
-	scoreRows, err := db.QueryContext(ctx, scoreQuery, baseParams...)
+	scoreRows, err := q.conn.QueryContext(q.ctx, scoreQuery, baseParams...)
 	if err != nil {
+		maybeResetOnFatal(err)
 		return nil, fmt.Errorf("match-score histogram query failed: %w", err)
 	}
 	defer scoreRows.Close() // last query in this function — safe to close on return
