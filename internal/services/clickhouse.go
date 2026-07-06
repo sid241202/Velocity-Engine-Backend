@@ -15,9 +15,10 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
-// istZone is the IST fixed timezone offset (UTC+05:30).
-// All timestamps returned to the frontend are formatted in this zone.
-var istZone = time.FixedZone("IST", 5*60*60+30*60)
+// NOTE: timestamp columns (windowStart, windowEnd, producedAt, ...) in
+// ClickHouse MUST be declared as DateTime('Asia/Kolkata') — Flink writes IST
+// wall-clock strings (e.g. "2026-07-06 14:30:00") with no timezone marker, so
+// only an explicit-IST column type interprets them correctly at insert time.
 
 var (
 	chDB    *sql.DB
@@ -110,12 +111,21 @@ func rowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
 		for i, col := range columns {
 			val := values[i]
 
-			// Convert time.Time to IST string so the frontend always gets IST-formatted timestamps
+			// Format time.Time using its own wall-clock fields — deliberately NOT
+			// calling .In(istZone) here. Flink writes naive IST wall-clock strings
+			// (no tz marker) into these columns; as long as the ClickHouse column
+			// is declared DateTime('Asia/Kolkata'), the driver already returns the
+			// correct IST digits and re-zoning is a no-op. But if a column were
+			// ever declared without that tz, .In(istZone) would silently ADD
+			// another +5:30 on top of ClickHouse's own (wrong) interpretation,
+			// compounding the error instead of fixing it. Printing the value's
+			// native fields as-is is correct under the required DDL and doesn't
+			// make a wrong DDL worse.
 			if t, ok := val.(time.Time); ok {
-				row[col] = t.In(istZone).Format("2006-01-02 15:04:05")
+				row[col] = t.Format("2006-01-02 15:04:05")
 			} else if t, ok := val.(*time.Time); ok {
 				if t != nil {
-					row[col] = t.In(istZone).Format("2006-01-02 15:04:05")
+					row[col] = t.Format("2006-01-02 15:04:05")
 				} else {
 					row[col] = nil
 				}

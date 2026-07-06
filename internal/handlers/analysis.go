@@ -236,3 +236,50 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 		"results": results,
 	})
 }
+
+// HistoricalBreakdown handles POST /rules/historical-breakdown
+// Returns forensic drill-down breakdowns (modality mix, auth outcome,
+// geographic hotspot, fingerprint match-score histogram) over the same
+// matched rows RunHistoricalAnalysis would use for this rule/time range.
+func (h *AnalysisHandler) HistoricalBreakdown(c *gin.Context) {
+	var rule models.VelocityRule
+	if err := c.ShouldBindJSON(&rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": fmt.Sprintf("Invalid request body: %s", err.Error())})
+		return
+	}
+
+	startTSRaw, _ := url.QueryUnescape(c.Query("start_ts"))
+	endTSRaw, _ := url.QueryUnescape(c.Query("end_ts"))
+	startTS := strings.TrimSpace(startTSRaw)
+	endTS := strings.TrimSpace(endTSRaw)
+
+	if startTS == "" || endTS == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "start_ts and end_ts are required query parameters"})
+		return
+	}
+
+	ruleJSON, err := json.Marshal(rule)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to serialize rule"})
+		return
+	}
+	var ruleDict map[string]interface{}
+	if err := json.Unmarshal(ruleJSON, &ruleDict); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to parse rule"})
+		return
+	}
+
+	slog.Info("HistoricalBreakdown request", "start_ts", startTS, "end_ts", endTS)
+
+	result, err := services.RunHistoricalBreakdown(c.Request.Context(), ruleDict, startTS, endTS)
+	if err != nil {
+		slog.Error("Historical breakdown failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"result": result,
+	})
+}

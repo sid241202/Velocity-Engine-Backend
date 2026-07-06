@@ -19,6 +19,12 @@ import (
 
 var icebergS3PathRegex = regexp.MustCompile(`^s3://[a-zA-Z0-9._/-]+$`)
 
+// istZone is the IST fixed timezone offset (UTC+05:30). The Iceberg
+// event_timestamp column is genuinely stored in UTC (unlike the ClickHouse
+// path, where Flink writes naive IST strings) — converting query results to
+// IST here for display is the correct, deliberate operation.
+var istZone = time.FixedZone("IST", 5*60*60+30*60)
+
 func init() {
 	if !icebergS3PathRegex.MatchString(config.IcebergS3Path) {
 		slog.Error("Invalid ICEBERG_S3_PATH format", "path", config.IcebergS3Path)
@@ -525,53 +531,51 @@ func initDuckDB() (*sql.DB, error) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// RunHistoricalAnalysis executes a historical analysis using DuckDB on Iceberg data.
-// ctx is the request context — cancellation aborts the in-flight DuckDB query and
-// releases the global duckDBMu lock so subsequent requests are not starved.
-func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
-	// IST timezone: UTC+5:30
-	ist := time.FixedZone("IST", 5*60*60+30*60)
+// prepareIcebergQuery resolves the IST time range, initializes the shared
+// DuckDB connection, locks duckDBMu, configures S3, and builds the
+// iceberg_scan source — the setup shared by every historical query
+// (RunHistoricalAnalysis, RunHistoricalBreakdown). The mutex is held on
+// return; callers MUST defer the returned unlock() for the entire duration of
+// their query execution (matching the existing "hold duckDBMu for the whole
+// S3-config + query sequence" invariant), even though each caller only runs
+// its own query shape against the shared source.
+func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (db *sql.DB, icebergSource string, startStr string, endStr string, unlock func(), err error) {
+	parseIST := func(ts string) (time.Time, error) {
+		formatted := strings.Replace(ts, "T", " ", 1)
+		if len(formatted) == 16 {
+			formatted += ":00"
+		}
+		return time.ParseInLocation("2006-01-02 15:04:05", formatted, istZone)
+	}
 
-    // Helper to parse strings in IST location
-    parseIST := func(ts string) (time.Time, error) {
-        // Ensure format is 2026-06-29 10:30:00
-        formatted := strings.Replace(ts, "T", " ", 1)
-        if len(formatted) == 16 { formatted += ":00" } // Add seconds if missing
-        return time.ParseInLocation("2006-01-02 15:04:05", formatted, ist)
-    }
+	var endDt, startDt time.Time
+	if endTS != "" {
+		endDt, err = parseIST(endTS)
+		if err != nil {
+			return nil, "", "", "", nil, fmt.Errorf("invalid end_ts format: %w", err)
+		}
+	} else {
+		endDt = time.Now().In(istZone)
+	}
+	if startTS != "" {
+		startDt, err = parseIST(startTS)
+		if err != nil {
+			return nil, "", "", "", nil, fmt.Errorf("invalid start_ts format: %w", err)
+		}
+	} else {
+		startDt = endDt.Add(-7 * 24 * time.Hour)
+	}
 
-    var endDt, startDt time.Time
-    var err error
-
-    // Resolve endDt
-    if endTS != "" {
-       endDt, err = parseIST(endTS)
-       if err != nil { return nil, fmt.Errorf("invalid end_ts format: %w", err) }
-    } else {
-       endDt = time.Now().In(ist)
-    }
-
-    // Resolve startDt
-    if startTS != "" {
-       startDt, err = parseIST(startTS)
-       if err != nil { return nil, fmt.Errorf("invalid start_ts format: %w", err) }
-    } else {
-       startDt = endDt.Add(-7 * 24 * time.Hour)
-    }
-
-	// Get (or lazily initialize) the shared DuckDB connection.
-	// Extensions are loaded once per process — no per-request install overhead.
-	db, err := initDuckDB()
+	db, err = initDuckDB()
 	if err != nil {
-		return nil, fmt.Errorf("DuckDB initialization failed: %w", err)
+		return nil, "", "", "", nil, fmt.Errorf("DuckDB initialization failed: %w", err)
 	}
 
 	// Hold the mutex for the entire S3-config + query sequence.
 	// initDuckDB released it above; we re-acquire here to serialize requests.
 	duckDBMu.Lock()
-	defer duckDBMu.Unlock()
+	unlock = func() { duckDBMu.Unlock() }
 
-	// Configure S3
 	s3Endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "http://"), "https://")
 	safeAccessKey := strings.ReplaceAll(config.S3AccessKey, "'", "''")
 	safeSecretKey := strings.ReplaceAll(config.S3SecretKey, "'", "''")
@@ -589,31 +593,45 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 		fmt.Sprintf("SET s3_use_ssl=%s", useSSL),
 	}
 	for _, stmt := range s3Stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("failed to set S3 config") // DO NOT leak stmt in error
+		if _, execErr := db.ExecContext(ctx, stmt); execErr != nil {
+			unlock()
+			return nil, "", "", "", nil, fmt.Errorf("failed to set S3 config") // DO NOT leak stmt in error
 		}
 	}
 
 	basePath := strings.TrimRight(config.IcebergS3Path, "/")
+	slog.Info("Scanning Iceberg table via native reader", "table_path", basePath)
 
-    slog.Info("Scanning Iceberg table via native reader", "table_path", basePath)
-
-    // Read via DuckDB's native Iceberg reader against the table's current
-    // snapshot (manifests + delete files) instead of globbing the /data/
-    // folder directly. A raw Parquet glob bypasses Iceberg's metadata layer
-    // entirely: no manifest-level partition/file pruning, no snapshot
-    // isolation (it can pick up orphaned or pre-compaction files still
-    // sitting under /data/ before GC runs), and no way to honor real delete
-    // files. allow_moved_paths handles the daily Spark compaction rewriting
-    // file locations underneath us.
-    // The QUALIFY dedup is kept as a defensive fallback on top of
-    // iceberg_scan's own delete handling until that's validated against
-    // production data — safe to remove once confirmed redundant.
-    icebergSource := fmt.Sprintf(`(
+	// Read via DuckDB's native Iceberg reader against the table's current
+	// snapshot (manifests + delete files) instead of globbing the /data/
+	// folder directly. A raw Parquet glob bypasses Iceberg's metadata layer
+	// entirely: no manifest-level partition/file pruning, no snapshot
+	// isolation (it can pick up orphaned or pre-compaction files still
+	// sitting under /data/ before GC runs), and no way to honor real delete
+	// files. allow_moved_paths handles the daily Spark compaction rewriting
+	// file locations underneath us.
+	// The QUALIFY dedup is kept as a defensive fallback on top of
+	// iceberg_scan's own delete handling until that's validated against
+	// production data — safe to remove once confirmed redundant.
+	icebergSource = fmt.Sprintf(`(
         SELECT * FROM iceberg_scan('%s', allow_moved_paths => true)
         QUALIFY row_number() OVER (PARTITION BY event_timestamp, authCode ORDER BY input_kafka_timestamp DESC NULLS LAST) = 1
     ) AS stream_data`, basePath)
-    // ──────────────────────────────────────────────────────────────────────
+
+	startStr = startDt.UTC().Format("2006-01-02 15:04:05")
+	endStr = endDt.UTC().Format("2006-01-02 15:04:05")
+	return db, icebergSource, startStr, endStr, unlock, nil
+}
+
+// RunHistoricalAnalysis executes a historical analysis using DuckDB on Iceberg data.
+// ctx is the request context — cancellation aborts the in-flight DuckDB query and
+// releases the global duckDBMu lock so subsequent requests are not starved.
+func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
+	db, icebergSource, startStr, endStr, unlock, err := prepareIcebergQuery(ctx, startTS, endTS)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	// Build the query dynamically based on the rule
 	grouping, _ := ruleDict["grouping"].(map[string]interface{})
@@ -742,16 +760,9 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 		thresholdMetCol = ", false as threshold_met"
 	}
 
-	// ── CRITICAL: convert IST → UTC before binding to DuckDB ─────────────────
-	// DuckDB's try_cast(? AS TIMESTAMP) treats bound string literals as UTC.
-	// The Iceberg event_timestamp column is also stored in UTC.
-	// If we pass IST-formatted strings (e.g. "10:00:00") DuckDB reads them as
-	// UTC, shifting the query window by +5h30m and returning wrong data.
-	// Converting to UTC here means "10:00 IST" → "04:30 UTC" in the query,
-	// which correctly filters rows whose event_timestamp is 10:00–11:00 IST.
-	startStr := startDt.UTC().Format("2006-01-02 15:04:05")
-	endStr := endDt.UTC().Format("2006-01-02 15:04:05")
-
+	// startStr/endStr (already UTC — see prepareIcebergQuery) are what gets
+	// bound to DuckDB's try_cast(? AS TIMESTAMP); the Iceberg event_timestamp
+	// column is also stored in UTC, so this is an apples-to-apples compare.
 	query := fmt.Sprintf(`
         SELECT
             time_bucket(INTERVAL '%d seconds', try_cast(%s AS TIMESTAMP)) as window_start,
@@ -775,8 +786,6 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 	allParams = append(allParams, filterParams...)
 
 	slog.Info("Executing DuckDB historical analysis",
-		"start_ist", startDt.Format("2006-01-02 15:04:05 IST"),
-		"end_ist", endDt.Format("2006-01-02 15:04:05 IST"),
 		"start_utc", startStr,
 		"end_utc", endStr,
 		"window_seconds", sizeSeconds,
@@ -815,10 +824,10 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 			switch v := val.(type) {
 			case time.Time:
 				// Format in IST so frontend always sees consistent IST timestamps
-				row[col] = v.In(ist).Format("2006-01-02 15:04:05")
+				row[col] = v.In(istZone).Format("2006-01-02 15:04:05")
 			case *time.Time:
 				if v != nil {
-					row[col] = v.In(ist).Format("2006-01-02 15:04:05")
+					row[col] = v.In(istZone).Format("2006-01-02 15:04:05")
 				} else {
 					row[col] = nil
 				}
@@ -836,4 +845,161 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 
 	slog.Info("DuckDB historical analysis complete", "result_rows", len(results))
 	return results, nil
+}
+
+// modalityBreakdownCols maps a display label to its Iceberg flag column.
+// Each column is a 0/1 DoubleType per the ingestion schema, so SUM() over the
+// matched rows gives a usage count for that auth modality.
+var modalityBreakdownCols = []struct{ Label, Col string }{
+	{"OTP", "otpusedflag"},
+	{"PIN", "pinusedflag"},
+	{"Biometric — Fingerprint", "btfmrusedflag"},
+	{"Biometric — Iris", "btiirusedflag"},
+	{"Face", "faceused"},
+	{"Demographic", "piusedflag"},
+}
+
+// RunHistoricalBreakdown computes forensic drill-down breakdowns (modality
+// mix, auth outcome, geographic hotspot, fingerprint match-score histogram)
+// over the exact same matched rows RunHistoricalAnalysis would use — same
+// iceberg_scan source, time range, and rule filter — but summarized across
+// the whole range instead of windowed. This is a drill-down feature used
+// occasionally, not a hot path, so it deliberately runs each breakdown as its
+// own query against the shared source rather than one hand-rolled multi-branch
+// UNION ALL: that would need every branch's ? placeholders kept in lockstep,
+// and a silent ordering mistake there would produce wrong breakdown numbers
+// with no visible error — a correctness risk not worth the saved DuckDB scans.
+func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) (map[string]interface{}, error) {
+	db, icebergSource, startStr, endStr, unlock, err := prepareIcebergQuery(ctx, startTS, endTS)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	var filterAST map[string]interface{}
+	if f, ok := ruleDict["filters"].(map[string]interface{}); ok {
+		filterAST = f
+	}
+	parsedWhere, filterParams := ParseFilterNode(filterAST)
+	whereClause := ""
+	if parsedWhere != "" {
+		whereClause = "AND " + parsedWhere
+	}
+
+	baseWhere := fmt.Sprintf(`
+		WHERE try_cast(event_timestamp AS TIMESTAMP) >= try_cast(? AS TIMESTAMP)
+		AND try_cast(event_timestamp AS TIMESTAMP) <= try_cast(? AS TIMESTAMP)
+		%s`, whereClause)
+	baseParams := append([]interface{}{startStr, endStr}, filterParams...)
+
+	// runCategoryBreakdown runs a "label -> count" GROUP BY query and returns
+	// it as a list of {label, count} maps for a uniform frontend shape.
+	runCategoryBreakdown := func(labelExpr, extraWhere, orderLimit string) ([]map[string]interface{}, error) {
+		query := fmt.Sprintf(`SELECT %s AS label, COUNT(*) AS count FROM %s %s %s GROUP BY 1 %s`,
+			labelExpr, icebergSource, baseWhere, extraWhere, orderLimit)
+		rows, qErr := db.QueryContext(ctx, query, baseParams...)
+		if qErr != nil {
+			return nil, qErr
+		}
+		defer rows.Close()
+		var out []map[string]interface{}
+		for rows.Next() {
+			var label string
+			var count int64
+			if scanErr := rows.Scan(&label, &count); scanErr != nil {
+				return nil, scanErr
+			}
+			out = append(out, map[string]interface{}{"label": label, "count": count})
+		}
+		return out, rows.Err()
+	}
+
+	result := make(map[string]interface{})
+
+	// ── Modality mix: one query, one row, one SUM column per modality ───────
+	var modalitySelects []string
+	for _, m := range modalityBreakdownCols {
+		modalitySelects = append(modalitySelects, fmt.Sprintf("CAST(COALESCE(SUM(%s),0) AS BIGINT) AS %s", m.Col, m.Col))
+	}
+	modalityQuery := fmt.Sprintf(`SELECT %s FROM %s %s`, strings.Join(modalitySelects, ", "), icebergSource, baseWhere)
+	modalityRows, err := db.QueryContext(ctx, modalityQuery, baseParams...)
+	if err != nil {
+		return nil, fmt.Errorf("modality breakdown query failed: %w", err)
+	}
+	// Explicit Close() (not deferred) — MaxOpenConns(1) means this rows set
+	// must release the connection before the next QueryContext call below, or
+	// that call would block waiting for a connection that never frees up.
+	var modalityMix []map[string]interface{}
+	if modalityRows.Next() {
+		vals := make([]interface{}, len(modalityBreakdownCols))
+		ptrs := make([]interface{}, len(modalityBreakdownCols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if scanErr := modalityRows.Scan(ptrs...); scanErr != nil {
+			modalityRows.Close()
+			return nil, fmt.Errorf("modality breakdown scan failed: %w", scanErr)
+		}
+		for i, m := range modalityBreakdownCols {
+			count, _ := vals[i].(int64)
+			modalityMix = append(modalityMix, map[string]interface{}{"label": m.Label, "count": count})
+		}
+	}
+	modalityRows.Close()
+	result["modality_mix"] = modalityMix
+
+	// ── Auth outcome (authresult) ────────────────────────────────────────────
+	authOutcome, err := runCategoryBreakdown("COALESCE(authresult, 'UNKNOWN')", "", "ORDER BY count DESC LIMIT 10")
+	if err != nil {
+		return nil, fmt.Errorf("auth outcome breakdown query failed: %w", err)
+	}
+	result["auth_outcome"] = authOutcome
+
+	// ── Geographic hotspot (top 10 states by matched-event volume) ──────────
+	geoHotspot, err := runCategoryBreakdown("COALESCE(locationstatecode, 'UNKNOWN')", "", "ORDER BY count DESC LIMIT 10")
+	if err != nil {
+		return nil, fmt.Errorf("geo hotspot breakdown query failed: %w", err)
+	}
+	result["geo_hotspot"] = geoHotspot
+
+	// ── Fingerprint match-score histogram (10-point buckets) ─────────────────
+	// Fingerprint is used as the representative biometric score since it's
+	// the most common modality in Aadhaar auth traffic — not a universal
+	// score across every rule.
+	scoreQuery := fmt.Sprintf(`
+		SELECT CAST(bucket_start AS VARCHAR) || '-' || CAST(bucket_start + 10 AS VARCHAR) AS label, COUNT(*) AS count
+		FROM (
+			SELECT FLOOR(fingermatchscore / 10) * 10 AS bucket_start
+			FROM %s
+			%s
+			AND fingermatchscore IS NOT NULL
+		) t
+		GROUP BY bucket_start
+		ORDER BY bucket_start`, icebergSource, baseWhere)
+	scoreRows, err := db.QueryContext(ctx, scoreQuery, baseParams...)
+	if err != nil {
+		return nil, fmt.Errorf("match-score histogram query failed: %w", err)
+	}
+	defer scoreRows.Close() // last query in this function — safe to close on return
+	var scoreHistogram []map[string]interface{}
+	for scoreRows.Next() {
+		var label string
+		var count int64
+		if scanErr := scoreRows.Scan(&label, &count); scanErr != nil {
+			return nil, fmt.Errorf("match-score histogram scan failed: %w", scanErr)
+		}
+		scoreHistogram = append(scoreHistogram, map[string]interface{}{"label": label, "count": count})
+	}
+	if err := scoreRows.Err(); err != nil {
+		return nil, fmt.Errorf("match-score histogram rows error: %w", err)
+	}
+	result["match_score_histogram"] = scoreHistogram
+
+	slog.Info("DuckDB historical breakdown complete",
+		"modality_rows", len(modalityMix),
+		"auth_outcome_rows", len(authOutcome),
+		"geo_hotspot_rows", len(geoHotspot),
+		"score_histogram_rows", len(scoreHistogram),
+	)
+	return result, nil
 }

@@ -136,6 +136,7 @@ func main() {
 	router.GET("/rules/anomaly-analysis", analysisHandler.AnomalyAnalysis)
 	router.POST("/rules/historical-test", analysisHandler.HistoricalTest)
 	router.POST("/rules/historical-analysis", analysisHandler.HistoricalAnalysis)
+	router.POST("/rules/historical-breakdown", analysisHandler.HistoricalBreakdown)
 
 	// Rule CRUD
 	router.POST("/rules", rulesHandler.CreateRule)
