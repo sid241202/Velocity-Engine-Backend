@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -354,10 +355,59 @@ func ParseFilterNode(node map[string]interface{}) (string, []interface{}) {
 			return fmt.Sprintf("%s IN (%s)", field, strings.Join(placeholders, ", ")), items
 		} else if op == "REGEX" {
 			return fmt.Sprintf("regexp_matches(%s, ?)", field), []interface{}{val}
+		} else if op == "CONTAINS" {
+			return fmt.Sprintf("contains(CAST(%s AS VARCHAR), CAST(? AS VARCHAR))", field), []interface{}{val}
+		} else if op == "NOT_CONTAINS" {
+			return fmt.Sprintf("NOT contains(CAST(%s AS VARCHAR), CAST(? AS VARCHAR))", field), []interface{}{val}
+		} else if op == "STARTS_WITH" {
+			return fmt.Sprintf("starts_with(CAST(%s AS VARCHAR), CAST(? AS VARCHAR))", field), []interface{}{val}
+		} else if op == "ENDS_WITH" {
+			return fmt.Sprintf("ends_with(CAST(%s AS VARCHAR), CAST(? AS VARCHAR))", field), []interface{}{val}
+		} else if op == "IS_NULL" {
+			return fmt.Sprintf("%s IS NULL", field), nil
+		} else if op == "IS_NOT_NULL" {
+			return fmt.Sprintf("%s IS NOT NULL", field), nil
+		} else if op == "DATE_BEFORE" || op == "DATE_AFTER" || op == "DATE_EQUALS" {
+			formatRaw, _ := node["format"].(string)
+			resolved, err := resolveDateFilterValue(val, formatRaw)
+			if err != nil {
+				slog.Warn("Invalid date filter value, dropping condition", "field", fieldRaw, "error", err)
+				return "", nil
+			}
+			dateOpMap := map[string]string{"DATE_BEFORE": "<", "DATE_AFTER": ">", "DATE_EQUALS": "="}
+			return fmt.Sprintf("try_cast(%s AS TIMESTAMP) %s try_cast(? AS TIMESTAMP)", field, dateOpMap[op]), []interface{}{resolved}
 		}
 	}
 
 	return "", nil
+}
+
+// resolveDateFilterValue converts a DATE_BEFORE/DATE_AFTER/DATE_EQUALS filter's
+// raw value into the naive-UTC "YYYY-MM-DD HH:MM:SS.sss" string this file binds
+// against TIMESTAMP columns with. The frontend contract (VisualFilterBuilder.jsx)
+// sends all date/time values as IST: EPOCH_MILLIS is an absolute instant (no
+// conversion needed beyond parsing), while ISO_STRING carries an explicit
+// "+05:30" offset that must be resolved before truncating to UTC — otherwise
+// this reintroduces the same +5:30 class of bug the start_ts/end_ts handling
+// above already had to work around.
+func resolveDateFilterValue(rawVal interface{}, format string) (string, error) {
+	valStr := strings.TrimSpace(fmt.Sprintf("%v", rawVal))
+	switch format {
+	case "EPOCH_MILLIS":
+		ms, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid EPOCH_MILLIS value %q: %w", valStr, err)
+		}
+		return time.UnixMilli(ms).UTC().Format("2006-01-02 15:04:05.000"), nil
+	case "ISO_STRING", "":
+		t, err := time.Parse(time.RFC3339, valStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid ISO_STRING value %q: %w", valStr, err)
+		}
+		return t.UTC().Format("2006-01-02 15:04:05.000"), nil
+	default:
+		return "", fmt.Errorf("unknown date format %q", format)
+	}
 }
 
 // safeHavingPattern is the regex for validating HAVING expressions.
@@ -544,21 +594,25 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 		}
 	}
 
-	partitionDate := startDt.Format("2006-01-02")
-    basePath := strings.TrimRight(config.IcebergS3Path, "/")
+	basePath := strings.TrimRight(config.IcebergS3Path, "/")
 
-    // Target the specific day partition
-    parquetGlob := fmt.Sprintf("%s/data/event_timestamp_day=%s/*.parquet", basePath, partitionDate)
+    slog.Info("Scanning Iceberg table via native reader", "table_path", basePath)
 
-    slog.Info("Scanning raw Parquet files by partition", "glob", parquetGlob)
-
-    // Using union_by_name=true handles schema evolution if columns change over time.
-    // The QUALIFY clause deduplicates the Flink "Equality Deletes" in memory
-    // as it streams, meaning you don't need a compacted table to get correct results.
+    // Read via DuckDB's native Iceberg reader against the table's current
+    // snapshot (manifests + delete files) instead of globbing the /data/
+    // folder directly. A raw Parquet glob bypasses Iceberg's metadata layer
+    // entirely: no manifest-level partition/file pruning, no snapshot
+    // isolation (it can pick up orphaned or pre-compaction files still
+    // sitting under /data/ before GC runs), and no way to honor real delete
+    // files. allow_moved_paths handles the daily Spark compaction rewriting
+    // file locations underneath us.
+    // The QUALIFY dedup is kept as a defensive fallback on top of
+    // iceberg_scan's own delete handling until that's validated against
+    // production data — safe to remove once confirmed redundant.
     icebergSource := fmt.Sprintf(`(
-        SELECT * FROM read_parquet('%s', union_by_name=true)
+        SELECT * FROM iceberg_scan('%s', allow_moved_paths => true)
         QUALIFY row_number() OVER (PARTITION BY event_timestamp, authCode ORDER BY input_kafka_timestamp DESC NULLS LAST) = 1
-    ) AS stream_data`, parquetGlob)
+    ) AS stream_data`, basePath)
     // ──────────────────────────────────────────────────────────────────────
 
 	// Build the query dynamically based on the rule
@@ -637,26 +691,15 @@ func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{},
 
 	aggClause := strings.Join(aggSelects, ", ")
 
-	// Window field
-	windowField := "event_timestamp"
+	// Historical analysis always windows and range-filters on the Iceberg
+	// `event_timestamp` column — the canonical ingestion-time field written
+	// by the Flink job. A rule's windowing.time_type / windowing.timestamp_field
+	// (e.g. reqDateTime, pidTs) only steers the live streaming engine's clock;
+	// honoring them here too let historical queries silently window/filter on
+	// sparse or inconsistent payload fields instead, producing wrong results
+	// for any rule using a custom timestamp source.
+	const windowField = "event_timestamp"
 	windowing, _ := ruleDict["windowing"].(map[string]interface{})
-	if windowing != nil {
-		timeType, _ := windowing["time_type"].(string)
-		useKafkaTS, _ := windowing["use_kafka_timestamp"].(bool)
-
-		if timeType == "PROCESSING_TIME" || useKafkaTS {
-			windowField = "event_timestamp"
-		} else {
-			uiTimeField, _ := windowing["timestamp_field"].(string)
-			if uiTimeField != "" && uiTimeField != "_event_timestamp_epoch_ms" {
-				translated := TranslateField(uiTimeField)
-				validated, err := ValidateIdentifier(translated)
-				if err == nil {
-					windowField = validated
-				}
-			}
-		}
-	}
 
 	// Window size
 	sizeMs := int64(300000)
