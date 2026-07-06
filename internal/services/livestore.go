@@ -44,7 +44,8 @@ func parseWindowStart(v interface{}) (time.Time, bool) {
 // LiveStore is a thread-safe in-memory rolling store for live rule results.
 type LiveStore struct {
 	mu          sync.RWMutex
-	data        map[string][]map[string]interface{} // ruleId -> rows
+	data        map[string][]map[string]interface{} // ruleId -> ordered rows
+	index       map[string]map[string]int           // ruleId -> compositeKey(groupKey,windowStart) -> slice position
 	totalRows   int
 	droppedRows int64 // cumulative count of rows dropped due to capacity cap
 	maxRows     int
@@ -55,6 +56,7 @@ type LiveStore struct {
 func NewLiveStore() *LiveStore {
 	ls := &LiveStore{
 		data:    make(map[string][]map[string]interface{}),
+		index:   make(map[string]map[string]int),
 		maxRows: config.LiveStoreMaxRows,
 		hours:   config.LiveStoreHours,
 	}
@@ -62,6 +64,31 @@ func NewLiveStore() *LiveStore {
 	// This replaces the O(N) prune-on-every-add pattern which blocked the write lock.
 	go ls.runPruner()
 	return ls
+}
+
+// rowCompositeKey builds the per-rule dedup identity for a row:
+// groupKey + windowStart. Uses a null-byte separator so a groupKey containing
+// a space or other printable char can't collide with a windowStart boundary.
+func rowCompositeKey(row map[string]interface{}) string {
+	groupKey, _ := row["groupKey"].(string)
+	return groupKey + "\x00" + fmt.Sprintf("%v", row["windowStart"])
+}
+
+// rebuildRuleIndex recomputes s.index[ruleID] from the current s.data[ruleID]
+// slice. Called after any structural change (prune/trim) that shifts slice
+// positions. O(rows-in-rule) but only ever runs off the hot Add path.
+// Must be called with s.mu held (write).
+func (s *LiveStore) rebuildRuleIndex(ruleID string) {
+	rows := s.data[ruleID]
+	if len(rows) == 0 {
+		delete(s.index, ruleID)
+		return
+	}
+	sub := make(map[string]int, len(rows))
+	for i, row := range rows {
+		sub[rowCompositeKey(row)] = i
+	}
+	s.index[ruleID] = sub
 }
 
 // runPruner is a background goroutine that periodically evicts stale rows.
@@ -82,27 +109,33 @@ func (s *LiveStore) runPruner() {
 // replace the prior entry in place instead of piling up one row per partial
 // tick. Replacing in place never changes a row's windowStart, so it doesn't
 // disturb the chronological-prefix assumption pruneStale/trimExcess rely on.
+//
+// The per-rule index makes the upsert O(1): the previous linear scan of the
+// rule's slice on every delta made filling the buffer O(n²), which matters now
+// that early-fire emits several partial ticks per window across many groupKeys.
 func (s *LiveStore) Add(row map[string]interface{}) {
 	ruleID, _ := row["ruleId"].(string)
 	if ruleID == "" {
 		ruleID = "unknown"
 	}
-	groupKey, _ := row["groupKey"].(string)
-	windowStart := fmt.Sprintf("%v", row["windowStart"])
+	ck := rowCompositeKey(row)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rows := s.data[ruleID]
-	for i, existing := range rows {
-		eGroupKey, _ := existing["groupKey"].(string)
-		if eGroupKey == groupKey && fmt.Sprintf("%v", existing["windowStart"]) == windowStart {
-			rows[i] = row
-			return
-		}
+	sub := s.index[ruleID]
+	if sub == nil {
+		sub = make(map[string]int)
+		s.index[ruleID] = sub
+	}
+	if pos, ok := sub[ck]; ok {
+		// In-place update of an existing (groupKey, windowStart) — O(1).
+		s.data[ruleID][pos] = row
+		return
 	}
 
-	s.data[ruleID] = append(rows, row)
+	s.data[ruleID] = append(s.data[ruleID], row)
+	sub[ck] = len(s.data[ruleID]) - 1
 	s.totalRows++
 	// Only enforce the hard cap inline; time-based pruning is done by the background goroutine.
 	if s.totalRows > s.maxRows {
@@ -111,10 +144,13 @@ func (s *LiveStore) Add(row map[string]interface{}) {
 }
 
 // Bootstrap replaces all data with the given rows (used at startup).
+// Bootstrap rows come from ClickHouse ... FINAL (already deduped by window), so
+// they're appended directly; the index is rebuilt per rule at the end.
 func (s *LiveStore) Bootstrap(rows []map[string]interface{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = make(map[string][]map[string]interface{})
+	s.index = make(map[string]map[string]int)
 	s.totalRows = 0
 	for _, row := range rows {
 		ruleID, _ := row["ruleId"].(string)
@@ -123,6 +159,9 @@ func (s *LiveStore) Bootstrap(rows []map[string]interface{}) {
 		}
 		s.data[ruleID] = append(s.data[ruleID], row)
 		s.totalRows++
+	}
+	for ruleID := range s.data {
+		s.rebuildRuleIndex(ruleID)
 	}
 	slog.Info("LiveStore bootstrapped", "total_rows", s.totalRows, "rule_count", len(s.data))
 }
@@ -178,6 +217,10 @@ func (s *LiveStore) pruneStale() {
 		}
 		if len(s.data[rid]) == 0 {
 			delete(s.data, rid)
+			delete(s.index, rid)
+		} else if startIdx > 0 {
+			// Positions shifted by the front-removal — rebuild this rule's index.
+			s.rebuildRuleIndex(rid)
 		}
 	}
 }
@@ -213,6 +256,10 @@ func (s *LiveStore) trimExcess() {
 		excess -= toRemove
 		if len(s.data[largestRID]) == 0 {
 			delete(s.data, largestRID)
+			delete(s.index, largestRID)
+		} else {
+			// Positions shifted by the front-removal — rebuild this rule's index.
+			s.rebuildRuleIndex(largestRID)
 		}
 	}
 }

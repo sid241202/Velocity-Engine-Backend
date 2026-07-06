@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// respondHistoricalError maps a historical-query service error to the right HTTP
+// status: ErrHistoricalEngineBusy is a transient capacity condition (the single
+// DuckDB slot was occupied) and must be retryable (503), not a 500. Everything
+// else is an internal error. The real error is logged by the caller; the client
+// only sees a generic, safe message.
+func respondHistoricalError(c *gin.Context, err error) {
+	if errors.Is(err, services.ErrHistoricalEngineBusy) {
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "The historical query engine is busy. Please retry in a few seconds."})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+}
 
 // AnalysisHandler handles live-analysis, agg-analysis, historical-test, and historical-analysis endpoints.
 type AnalysisHandler struct {
@@ -180,7 +195,7 @@ func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 	)
 	if err != nil {
 		slog.Error("Historical test failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		respondHistoricalError(c, err)
 		return
 	}
 
@@ -227,7 +242,7 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 	results, err := services.RunHistoricalAnalysis(c.Request.Context(), ruleDict, startTS, endTS)
 	if err != nil {
 		slog.Error("Historical analysis failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		respondHistoricalError(c, err)
 		return
 	}
 
@@ -274,7 +289,7 @@ func (h *AnalysisHandler) HistoricalBreakdown(c *gin.Context) {
 	result, err := services.RunHistoricalBreakdown(c.Request.Context(), ruleDict, startTS, endTS)
 	if err != nil {
 		slog.Error("Historical breakdown failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+		respondHistoricalError(c, err)
 		return
 	}
 
