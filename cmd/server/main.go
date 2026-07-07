@@ -81,16 +81,17 @@ func main() {
 		csvStore = nil
 	}
 
-	// RBAC (MySQL): apply migrations at startup. Non-fatal by design — the
-	// rest of the backend does not depend on MySQL, so a migration failure
-	// here logs loudly and continues; routes guarded by RequirePermission
-	// will fail closed (503) until this is resolved, matching the same
-	// resilience philosophy as the ClickHouse/DuckDB init paths.
+	// RBAC (MySQL): verify the required schema already exists. This backend
+	// never creates, alters, or seeds the RBAC tables — they are provisioned
+	// manually per environment (see internal/migrations/mysql/0001_init_rbac.sql
+	// for the DDL to run by hand). Non-fatal by design, same as the
+	// ClickHouse/DuckDB init paths: routes guarded by RequirePermission will
+	// fail closed (503) until the schema is confirmed present.
 	func() {
-		migrationCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := services.RunMySQLMigrations(migrationCtx); err != nil {
-			slog.Error("MySQL RBAC migrations failed — RBAC-protected routes will be unavailable until this is resolved", "error", err)
+		if err := services.VerifyMySQLSchema(verifyCtx); err != nil {
+			slog.Error("MySQL RBAC schema verification failed — RBAC-protected routes will be unavailable until this is resolved", "error", err)
 		}
 	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)

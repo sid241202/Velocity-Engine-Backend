@@ -3,9 +3,10 @@
 -- + Audit Log. See project RBAC design notes for the role/permission matrix
 -- this seed data implements.
 --
--- Applied automatically at backend startup by internal/services/mysql.go
--- (RunMySQLMigrations), tracked in schema_migrations, guarded by a MySQL
--- advisory lock so multiple replicas booting concurrently don't race.
+-- Run this manually with a mysql client against the target database — the
+-- backend never creates, alters, or seeds this schema itself. At startup it
+-- only verifies these tables exist (internal/services/mysql.go,
+-- VerifyMySQLSchema) and fails RBAC-protected routes closed if they don't.
 
 CREATE TABLE users (
     id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

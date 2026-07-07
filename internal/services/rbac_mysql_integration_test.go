@@ -2,13 +2,19 @@
 
 // Integration test against a REAL MySQL instance — proves the actual DDL in
 // internal/migrations/mysql/0001_init_rbac.sql is valid MySQL and that the
-// real queries in fetchUserPermissionsFromDB / RunMySQLMigrations work
+// real queries in fetchUserPermissionsFromDB / VerifyMySQLSchema work
 // end-to-end, not just the pure-Go cache logic covered by rbac_test.go.
+//
+// The backend never applies this schema itself (see VerifyMySQLSchema in
+// mysql.go) — apply internal/migrations/mysql/0001_init_rbac.sql to the
+// target database yourself before running this test, exactly as an operator
+// would in a real environment.
 //
 // Opt-in via build tag so `go test ./...` never requires MySQL to be
 // present (and can't fail in a CI that doesn't have it wired up). Run with:
 //
 //	MYSQL_HOST=... MYSQL_PORT=... MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=... \
+//	  mysql ... < internal/migrations/mysql/0001_init_rbac.sql && \
 //	  go test -tags mysql_integration -v ./internal/services/... -run MySQLIntegration
 package services
 
@@ -20,19 +26,19 @@ import (
 	"velocity-engine-control-plane-backend-go/internal/config"
 )
 
-func TestMySQLIntegration_MigrationsAndPermissionResolution(t *testing.T) {
+func TestMySQLIntegration_SchemaVerificationAndPermissionResolution(t *testing.T) {
 	ResetMySQLConn()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := RunMySQLMigrations(ctx); err != nil {
-		t.Fatalf("RunMySQLMigrations failed against real MySQL: %v", err)
+	if err := VerifyMySQLSchema(ctx); err != nil {
+		t.Fatalf("VerifyMySQLSchema failed against real MySQL — apply internal/migrations/mysql/0001_init_rbac.sql manually first: %v", err)
 	}
 
-	// Re-running must be a no-op (idempotency / schema_migrations tracking).
-	if err := RunMySQLMigrations(ctx); err != nil {
-		t.Fatalf("RunMySQLMigrations (second run) failed: %v", err)
+	// Verifying again must be side-effect-free (read-only).
+	if err := VerifyMySQLSchema(ctx); err != nil {
+		t.Fatalf("VerifyMySQLSchema (second run) failed: %v", err)
 	}
 
 	db, err := getMySQLDB()

@@ -5,11 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"sort"
+	"strings"
 	"sync"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
-	"velocity-engine-control-plane-backend-go/internal/migrations"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -20,18 +19,14 @@ var (
 	mysqlDBErr error
 )
 
-// mysqlDSN builds the connection string for the given database/user, with the
-// given extra options appended. multiStatements is intentionally NOT part of
-// the base app DSN (getMySQLDB) — it's only enabled on the dedicated
-// migration connection (runMigrationsConn), so a compromised or buggy query
-// path elsewhere in the app can never smuggle in a stacked statement.
-func mysqlDSN(extra string) string {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4",
+// mysqlDSN builds the connection string for the app's MySQL pool. Never
+// enables multiStatements — this backend only ever runs single, parameterized
+// statements against MySQL (schema changes are a manual, out-of-band step;
+// see VerifyMySQLSchema), so a compromised or buggy query path can't smuggle
+// in a stacked statement.
+func mysqlDSN() string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4",
 		config.MySQLUser, config.MySQLPassword, config.MySQLHost, config.MySQLPort, config.MySQLDatabase)
-	if extra != "" {
-		dsn += "&" + extra
-	}
-	return dsn
 }
 
 // getMySQLDB returns the singleton MySQL connection pool used for regular RBAC
@@ -46,7 +41,7 @@ func getMySQLDB() (*sql.DB, error) {
 		return mysqlDB, nil
 	}
 
-	db, err := sql.Open("mysql", mysqlDSN(""))
+	db, err := sql.Open("mysql", mysqlDSN())
 	if err != nil {
 		mysqlDBErr = err
 		return nil, err
@@ -107,92 +102,70 @@ func IsMySQLReady() (bool, string) {
 	return true, ""
 }
 
-// RunMySQLMigrations applies any not-yet-applied embedded migrations, in
-// filename order, tracked in a schema_migrations table. Guarded by a MySQL
-// advisory lock (GET_LOCK) so multiple backend replicas booting concurrently
-// don't race to apply the same migration twice.
-//
-// Uses its own short-lived connection with multiStatements=true — migration
-// files contain multiple DDL/DML statements — kept entirely separate from the
-// pooled app connection (getMySQLDB), which never enables multiStatements.
-//
-// Returns an error if migrations cannot be applied; callers should treat this
-// as non-fatal to process startup (log loudly and continue) since routes
-// protected by RBAC will simply fail closed until this is resolved, but the
-// rest of the backend does not depend on MySQL.
-func RunMySQLMigrations(ctx context.Context) error {
-	db, err := sql.Open("mysql", mysqlDSN("multiStatements=true"))
+// requiredRBACTables lists the tables the RBAC subsystem expects to already
+// exist in MySQL. This backend never creates, alters, or seeds this schema —
+// tables are provisioned manually, per environment, by whoever operates
+// MySQL there. See internal/migrations/mysql/0001_init_rbac.sql for the
+// canonical DDL + seed data to run by hand with a mysql client.
+var requiredRBACTables = []string{"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log"}
+
+// VerifyMySQLSchema checks that the RBAC tables already exist in MySQL. It
+// is read-only: it never creates, alters, or seeds anything. Returns a
+// non-nil error if MySQL is unreachable or any required table is missing,
+// naming exactly which ones — callers should treat this as non-fatal to
+// process startup (log loudly and continue), matching the resilience
+// philosophy used for ClickHouse/DuckDB: RBAC-protected routes fail closed
+// (503) until the schema is confirmed present, but the rest of the backend
+// does not depend on MySQL.
+func VerifyMySQLSchema(ctx context.Context) error {
+	db, err := getMySQLDB()
 	if err != nil {
-		return fmt.Errorf("failed to open migration connection: %w", err)
+		return fmt.Errorf("cannot verify MySQL RBAC schema — connection failed: %w", err)
 	}
-	defer db.Close()
-	db.SetMaxOpenConns(1) // GET_LOCK is session-scoped; must stay on the same connection throughout
 
-	conn, err := db.Conn(ctx)
+	placeholders := make([]string, len(requiredRBACTables))
+	args := make([]interface{}, 0, len(requiredRBACTables)+1)
+	args = append(args, config.MySQLDatabase)
+	for i, t := range requiredRBACTables {
+		placeholders[i] = "?"
+		args = append(args, t)
+	}
+	query := fmt.Sprintf(
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN (%s)",
+		strings.Join(placeholders, ", "),
+	)
+
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("failed to acquire migration connection: %w", err)
+		return fmt.Errorf("failed to query information_schema for RBAC tables: %w", err)
 	}
-	defer conn.Close()
+	defer rows.Close()
 
-	const lockName = "velocity_engine_rbac_migrations"
-	var lockAcquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 30)", lockName).Scan(&lockAcquired); err != nil {
-		return fmt.Errorf("failed to acquire migration lock: %w", err)
-	}
-	if !lockAcquired.Valid || lockAcquired.Int64 != 1 {
-		return fmt.Errorf("could not acquire migration lock %q within timeout — another instance may be migrating, or MySQL is unavailable", lockName)
-	}
-	defer func() {
-		if _, err := conn.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", lockName); err != nil {
-			slog.Warn("Failed to release migration lock", "error", err)
+	found := make(map[string]bool, len(requiredRBACTables))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("failed to scan information_schema row: %w", err)
 		}
-	}()
-
-	if _, err := conn.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version     VARCHAR(255) PRIMARY KEY,
-			applied_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-	`); err != nil {
-		return fmt.Errorf("failed to ensure schema_migrations table: %w", err)
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating information_schema rows: %w", err)
 	}
 
-	entries, err := migrations.MySQLFS.ReadDir("mysql")
-	if err != nil {
-		return fmt.Errorf("failed to read embedded migrations: %w", err)
+	var missing []string
+	for _, t := range requiredRBACTables {
+		if !found[t] {
+			missing = append(missing, t)
+		}
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-
-	applied := 0
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		version := e.Name()
-
-		var exists int
-		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", version).Scan(&exists); err != nil {
-			return fmt.Errorf("failed to check migration status for %s: %w", version, err)
-		}
-		if exists > 0 {
-			continue
-		}
-
-		content, err := migrations.MySQLFS.ReadFile("mysql/" + version)
-		if err != nil {
-			return fmt.Errorf("failed to read migration %s: %w", version, err)
-		}
-
-		slog.Info("Applying MySQL migration", "version", version)
-		if _, err := conn.ExecContext(ctx, string(content)); err != nil {
-			return fmt.Errorf("failed to apply migration %s: %w", version, err)
-		}
-		if _, err := conn.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES (?)", version); err != nil {
-			return fmt.Errorf("failed to record migration %s as applied: %w", version, err)
-		}
-		applied++
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"MySQL database %q is missing required RBAC table(s) %v — run internal/migrations/mysql/0001_init_rbac.sql manually against this database to provision them",
+			config.MySQLDatabase, missing,
+		)
 	}
 
-	slog.Info("MySQL migrations complete", "applied", applied, "total", len(entries))
+	slog.Info("MySQL RBAC schema verified", "database", config.MySQLDatabase, "tables", requiredRBACTables)
 	return nil
 }
