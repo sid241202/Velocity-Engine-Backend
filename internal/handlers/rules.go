@@ -43,11 +43,19 @@ func (h *RulesHandler) ReadRoot(c *gin.Context) {
 }
 
 // Health handles GET /health (liveness probe — is the process alive?)
+// mysql is informational only — it does not affect the "healthy" status,
+// since most of this backend's functionality does not depend on MySQL/RBAC.
 func (h *RulesHandler) Health(c *gin.Context) {
+	mysqlOK, mysqlReason := services.IsMySQLReady()
+	mysqlStatus := "ok"
+	if !mysqlOK {
+		mysqlStatus = mysqlReason
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "healthy",
 		"live_store":     h.liveStore.Stats(),
 		"ws_connections": h.wsManager.ConnectionCount(),
+		"mysql":          mysqlStatus,
 	})
 }
 

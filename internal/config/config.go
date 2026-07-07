@@ -40,6 +40,34 @@ var (
 	LiveStoreMaxRows = getEnvInt("LIVE_STORE_MAX_ROWS", 50000)
 	LiveStoreHours   = getEnvInt("LIVE_STORE_HOURS", 24)
 	WSHeartbeatSec   = getEnvInt("WS_HEARTBEAT_INTERVAL", 30)
+
+	// MySQL (RBAC store)
+	MySQLHost         = getEnv("MYSQL_HOST", "localhost")
+	MySQLPort         = getEnvInt("MYSQL_PORT", 3306)
+	MySQLUser         = getEnv("MYSQL_USER", "root")
+	MySQLPassword     = getEnv("MYSQL_PASSWORD", "")
+	MySQLDatabase     = getEnv("MYSQL_DATABASE", "velocity_engine_iam")
+	MySQLMaxOpenConns = getEnvInt("MYSQL_MAX_OPEN_CONNS", 20)
+	MySQLMaxIdleConns = getEnvInt("MYSQL_MAX_IDLE_CONNS", 10)
+
+	// RBAC
+	// RBACPermissionCacheTTLSeconds: how long a resolved (roles, permissions) set
+	// is served from memory before re-querying MySQL. See RBACPermissionMaxStaleSeconds
+	// below for the fail-tolerant fallback bound during a MySQL outage.
+	RBACPermissionCacheTTLSeconds = getEnvInt("RBAC_PERMISSION_CACHE_TTL_SECONDS", 300)
+	// RBACPermissionMaxStaleSeconds bounds how long a cached permission set may
+	// keep being served past its TTL if MySQL is unreachable when a refresh is
+	// attempted. This is a deliberate availability/security tradeoff: a brief
+	// MySQL blip shouldn't lock every user out of the whole control plane, but
+	// serving a since-revoked permission set indefinitely is a real security
+	// exposure — so staleness is tolerated only up to this bound, after which
+	// authorization checks fail closed (503) instead of trusting old data forever.
+	RBACPermissionMaxStaleSeconds = getEnvInt("RBAC_PERMISSION_MAX_STALE_SECONDS", 1800)
+	// AuthDevMode enables the TEMPORARY pre-WSO2 identity shim (X-Debug-User-Id
+	// header) used until real token validation is implemented. See
+	// internal/middleware/auth.go. Guarded below: refuses to boot with this on
+	// in a prod environment, mirroring the existing S3 key check in init().
+	AuthDevMode = getEnv("AUTH_DEV_MODE", "true") == "true"
 )
 
 func init() {
@@ -49,6 +77,11 @@ func init() {
 		if os.Getenv("ENV") == "prod" {
 			panic("S3_ACCESS_KEY and S3_SECRET_KEY are required")
 		}
+	}
+	if AuthDevMode && os.Getenv("ENV") == "prod" {
+		// AuthDevMode bypasses real identity verification (see
+		// internal/middleware/auth.go) — it must never be reachable in prod.
+		panic("AUTH_DEV_MODE must be false (or unset) when ENV=prod — it is a pre-WSO2 development identity bypass")
 	}
 }
 
