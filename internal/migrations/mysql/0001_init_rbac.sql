@@ -39,12 +39,19 @@ CREATE TABLE permissions (
     UNIQUE KEY uq_permissions_resource_action (resource, action)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- user_roles: ONE ROLE PER USER, enforced by the database, not just convention.
+-- user_id is the primary key itself (not a composite (user_id, role_id) key)
+-- so a second INSERT for a user who already has a role fails outright rather
+-- than silently accumulating a second role — the old composite-key design
+-- allowed a user to hold multiple roles at once (their permissions became
+-- the union of all of them), which is how a "temporary upgrade" that's never
+-- explicitly reverted quietly turns permanent. See the reassignment example
+-- below for the correct way to change someone's role under this constraint.
 CREATE TABLE user_roles (
-    user_id     BIGINT UNSIGNED NOT NULL,
+    user_id     BIGINT UNSIGNED NOT NULL PRIMARY KEY,
     role_id     INT UNSIGNED NOT NULL,
     assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     assigned_by BIGINT UNSIGNED NULL,     -- who granted this — nullable for system-seeded assignments
-    PRIMARY KEY (user_id, role_id),
     KEY idx_user_roles_role_id (role_id),  -- supports "who has role X" without a full scan
     CONSTRAINT fk_user_roles_user        FOREIGN KEY (user_id)     REFERENCES users(id)  ON DELETE CASCADE,
     CONSTRAINT fk_user_roles_role        FOREIGN KEY (role_id)     REFERENCES roles(id)  ON DELETE CASCADE,
@@ -115,3 +122,24 @@ WHERE r.name = 'READ_ONLY_ANALYST' AND (
     (p.resource = 'rules' AND p.action = 'read')
     OR p.resource IN ('live_analysis','aggregated_analysis','historical_analysis')
 );
+
+-- ── Assigning / reassigning a user's role (manual, until an admin endpoint exists) ──
+--
+-- Because user_id is user_roles' primary key, assigning a role is a plain
+-- INSERT the first time, but reassigning an existing user needs an upsert —
+-- a second plain INSERT for the same user_id fails on the primary key
+-- (correctly — that's the one-role-per-user guarantee doing its job).
+--
+-- INSERT INTO user_roles (user_id, role_id, assigned_by)
+-- VALUES (?, (SELECT id FROM roles WHERE name = 'RULE_EDITOR'), ?)
+-- ON DUPLICATE KEY UPDATE
+--     role_id     = VALUES(role_id),
+--     assigned_at = CURRENT_TIMESTAMP,
+--     assigned_by = VALUES(assigned_by);
+--
+-- Note: the backend caches a user's resolved permissions for up to
+-- RBAC_PERMISSION_CACHE_TTL_SECONDS (default 300s) — a role change here
+-- doesn't take effect for that user until the cache entry expires or the
+-- backend restarts. There's no manual invalidation path yet; that's planned
+-- alongside the future admin endpoint that will run this upsert instead of
+-- requiring hand-written SQL.
