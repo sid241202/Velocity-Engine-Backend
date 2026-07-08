@@ -102,31 +102,33 @@ func IsMySQLReady() (bool, string) {
 	return true, ""
 }
 
-// requiredRBACTables lists the tables the RBAC subsystem expects to already
-// exist in MySQL. This backend never creates, alters, or seeds this schema —
-// tables are provisioned manually, per environment, by whoever operates
-// MySQL there. See internal/migrations/mysql/0001_init_rbac.sql for the
-// canonical DDL + seed data to run by hand with a mysql client.
-var requiredRBACTables = []string{"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log"}
+// requiredTables lists every table this backend expects to already exist in
+// MySQL: the RBAC tables (see internal/migrations/mysql/0001_init_rbac.sql)
+// plus "rules", the durable rule-definition store (see
+// internal/migrations/mysql/0002_init_rules_store.sql and
+// internal/services/rule_store.go). This backend never creates, alters, or
+// seeds any of this schema — it's provisioned manually, per environment, by
+// whoever operates MySQL there.
+var requiredTables = []string{"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log", "rules"}
 
-// VerifyMySQLSchema checks that the RBAC tables already exist in MySQL. It
-// is read-only: it never creates, alters, or seeds anything. Returns a
+// VerifyMySQLSchema checks that all required tables already exist in MySQL.
+// It is read-only: it never creates, alters, or seeds anything. Returns a
 // non-nil error if MySQL is unreachable or any required table is missing,
 // naming exactly which ones — callers should treat this as non-fatal to
 // process startup (log loudly and continue), matching the resilience
-// philosophy used for ClickHouse/DuckDB: RBAC-protected routes fail closed
-// (503) until the schema is confirmed present, but the rest of the backend
-// does not depend on MySQL.
+// philosophy used for ClickHouse/DuckDB: routes/features depending on a
+// missing table fail closed until the schema is confirmed present, but the
+// rest of the backend does not depend on MySQL.
 func VerifyMySQLSchema(ctx context.Context) error {
 	db, err := getMySQLDB()
 	if err != nil {
-		return fmt.Errorf("cannot verify MySQL RBAC schema — connection failed: %w", err)
+		return fmt.Errorf("cannot verify MySQL schema — connection failed: %w", err)
 	}
 
-	placeholders := make([]string, len(requiredRBACTables))
-	args := make([]interface{}, 0, len(requiredRBACTables)+1)
+	placeholders := make([]string, len(requiredTables))
+	args := make([]interface{}, 0, len(requiredTables)+1)
 	args = append(args, config.MySQLDatabase)
-	for i, t := range requiredRBACTables {
+	for i, t := range requiredTables {
 		placeholders[i] = "?"
 		args = append(args, t)
 	}
@@ -137,11 +139,11 @@ func VerifyMySQLSchema(ctx context.Context) error {
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("failed to query information_schema for RBAC tables: %w", err)
+		return fmt.Errorf("failed to query information_schema for required tables: %w", err)
 	}
 	defer rows.Close()
 
-	found := make(map[string]bool, len(requiredRBACTables))
+	found := make(map[string]bool, len(requiredTables))
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
@@ -154,18 +156,18 @@ func VerifyMySQLSchema(ctx context.Context) error {
 	}
 
 	var missing []string
-	for _, t := range requiredRBACTables {
+	for _, t := range requiredTables {
 		if !found[t] {
 			missing = append(missing, t)
 		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf(
-			"MySQL database %q is missing required RBAC table(s) %v — run internal/migrations/mysql/0001_init_rbac.sql manually against this database to provision them",
+			"MySQL database %q is missing required table(s) %v — run the relevant internal/migrations/mysql/*.sql file(s) manually against this database to provision them",
 			config.MySQLDatabase, missing,
 		)
 	}
 
-	slog.Info("MySQL RBAC schema verified", "database", config.MySQLDatabase, "tables", requiredRBACTables)
+	slog.Info("MySQL schema verified", "database", config.MySQLDatabase, "tables", requiredTables)
 	return nil
 }

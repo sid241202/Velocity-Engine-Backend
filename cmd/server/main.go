@@ -15,7 +15,6 @@ import (
 	"velocity-engine-control-plane-backend-go/internal/handlers"
 	"velocity-engine-control-plane-backend-go/internal/middleware"
 	"velocity-engine-control-plane-backend-go/internal/services"
-	"velocity-engine-control-plane-backend-go/internal/store"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -74,30 +73,37 @@ func main() {
 	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
 	anomalyConsumer.Start()
 
-	// Open CSV persistence store (ephemeral local storage for staging)
-	csvStore, csvErr := store.Open("/tmp/velocity")
-	if csvErr != nil {
-		slog.Warn("CSVStore failed to open — rule persistence disabled", "error", csvErr)
-		csvStore = nil
-	}
-
-	// RBAC (MySQL): verify the required schema already exists. This backend
-	// never creates, alters, or seeds the RBAC tables — they are provisioned
-	// manually per environment (see internal/migrations/mysql/0001_init_rbac.sql
-	// for the DDL to run by hand). Non-fatal by design, same as the
-	// ClickHouse/DuckDB init paths: routes guarded by RequirePermission will
-	// fail closed (503) until the schema is confirmed present.
+	// MySQL: verify the required schema already exists (RBAC tables + the
+	// rules table used for durable rule-definition storage). This backend
+	// never creates, alters, or seeds this schema — it's provisioned
+	// manually per environment (see internal/migrations/mysql/*.sql for the
+	// DDL to run by hand). Non-fatal by design, same as the ClickHouse/DuckDB
+	// init paths: RBAC-protected routes fail closed (503), and rule
+	// creation/edits fail closed (503) with a clear error, until the schema
+	// is confirmed present — but the rest of the backend keeps running.
 	func() {
 		verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := services.VerifyMySQLSchema(verifyCtx); err != nil {
-			slog.Error("MySQL RBAC schema verification failed — RBAC-protected routes will be unavailable until this is resolved", "error", err)
+			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
 		}
 	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
 	// Create handlers
-	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager, csvStore)
+	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
+
+	// Reload the rule list from MySQL — this is what lets the backend
+	// survive a restart with GET /rules still showing what was there before,
+	// instead of coming back empty (the previous CSV-based rule store never
+	// supported reading its own history back). Non-fatal: if MySQL is down,
+	// rulesDB just starts empty and self-heals as rules are recreated/edited.
+	func() {
+		loadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		rulesHandler.LoadFromMySQL(loadCtx)
+	}()
+
 	analysisHandler := handlers.NewAnalysisHandler(liveStore, anomalyStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
 	iamHandler := handlers.NewIAMHandler()
@@ -225,11 +231,6 @@ func main() {
 
 	// Close Kafka producer
 	services.CloseProducer()
-
-	// Close CSV store (drains write channels)
-	if csvStore != nil {
-		csvStore.Close()
-	}
 
 	// Close ClickHouse
 	services.CloseClickHouse()
