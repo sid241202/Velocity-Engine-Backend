@@ -104,12 +104,15 @@ func IsMySQLReady() (bool, string) {
 
 // requiredTables lists every table this backend expects to already exist in
 // MySQL: the RBAC tables (see internal/migrations/mysql/0001_init_rbac.sql)
-// plus "rules", the durable rule-definition store (see
+// plus the five rule-definition store tables (see
 // internal/migrations/mysql/0002_init_rules_store.sql and
 // internal/services/rule_store.go). This backend never creates, alters, or
 // seeds any of this schema — it's provisioned manually, per environment, by
 // whoever operates MySQL there.
-var requiredTables = []string{"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log", "rules"}
+var requiredTables = []string{
+	"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log",
+	"rules", "window_configs", "sink_configs", "aggregation_specs", "breach_conditions",
+}
 
 // VerifyMySQLSchema checks that all required tables already exist in MySQL.
 // It is read-only: it never creates, alters, or seeds anything. Returns a

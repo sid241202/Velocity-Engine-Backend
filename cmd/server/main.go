@@ -74,7 +74,7 @@ func main() {
 	anomalyConsumer.Start()
 
 	// MySQL: verify the required schema already exists (RBAC tables + the
-	// rules table used for durable rule-definition storage). This backend
+	// five rule-definition storage tables). This backend
 	// never creates, alters, or seeds this schema — it's provisioned
 	// manually per environment (see internal/migrations/mysql/*.sql for the
 	// DDL to run by hand). Non-fatal by design, same as the ClickHouse/DuckDB

@@ -267,7 +267,7 @@ func (h *RulesHandler) PublishRule(c *gin.Context) {
 	// case, a restart between now and the next successful write on this
 	// rule would reload it in its previous status; the log line is what
 	// makes that narrow window operationally visible.
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "ACTIVE", newPayload, false); err != nil {
+	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "ACTIVE", false); err != nil {
 		slog.Error("Rule published to Kafka but failed to persist status", "rule_id", ruleID, "error", err)
 	}
 
@@ -335,7 +335,7 @@ func (h *RulesHandler) UpdateRuleStatus(c *gin.Context) {
 		return
 	}
 
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, req.Status, newPayload, false); err != nil {
+	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, req.Status, false); err != nil {
 		slog.Error("Rule status published to Kafka but failed to persist", "rule_id", ruleID, "status", req.Status, "error", err)
 	}
 
@@ -383,15 +383,6 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 		}
 	}
 
-	if rm, ok := ruleDict["rule_metadata"].(map[string]interface{}); ok {
-		rm["status"] = "DELETED"
-	}
-	newPayload, err := json.Marshal(ruleDict)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
-		return
-	}
-
 	// If it was ever published, the Kafka tombstone above already confirmed
 	// Flink stopped enforcing it, so it's safe to mark this deleted/inactive
 	// now. If it was never published, there was no live Flink state to begin
@@ -399,7 +390,7 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 	// logged loudly but doesn't block removal from memory: the row is
 	// harmless leftover state (still marked active) that self-corrects the
 	// next time this rule_id is reused, or can be cleaned up manually.
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "DELETED", newPayload, true); err != nil {
+	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "DELETED", true); err != nil {
 		slog.Error("Rule deleted but failed to persist tombstone", "rule_id", ruleID, "error", err)
 	}
 
