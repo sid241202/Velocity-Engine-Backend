@@ -13,8 +13,8 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/handlers"
+	"velocity-engine-control-plane-backend-go/internal/middleware"
 	"velocity-engine-control-plane-backend-go/internal/services"
-	"velocity-engine-control-plane-backend-go/internal/store"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -73,17 +73,40 @@ func main() {
 	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
 	anomalyConsumer.Start()
 
-	// Open CSV persistence store (ephemeral local storage for staging)
-	csvStore, csvErr := store.Open("/tmp/velocity")
-	if csvErr != nil {
-		slog.Warn("CSVStore failed to open — rule persistence disabled", "error", csvErr)
-		csvStore = nil
-	}
+	// MySQL: verify the required schema already exists (RBAC tables + the
+	// five rule-definition storage tables). This backend
+	// never creates, alters, or seeds this schema — it's provisioned
+	// manually per environment (see internal/migrations/mysql/*.sql for the
+	// DDL to run by hand). Non-fatal by design, same as the ClickHouse/DuckDB
+	// init paths: RBAC-protected routes fail closed (503), and rule
+	// creation/edits fail closed (503) with a clear error, until the schema
+	// is confirmed present — but the rest of the backend keeps running.
+	func() {
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := services.VerifyMySQLSchema(verifyCtx); err != nil {
+			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
+		}
+	}()
+	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
 	// Create handlers
-	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager, csvStore)
+	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
+
+	// Reload the rule list from MySQL — this is what lets the backend
+	// survive a restart with GET /rules still showing what was there before,
+	// instead of coming back empty (the previous CSV-based rule store never
+	// supported reading its own history back). Non-fatal: if MySQL is down,
+	// rulesDB just starts empty and self-heals as rules are recreated/edited.
+	func() {
+		loadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		rulesHandler.LoadFromMySQL(loadCtx)
+	}()
+
 	analysisHandler := handlers.NewAnalysisHandler(liveStore, anomalyStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
+	iamHandler := handlers.NewIAMHandler()
 
 	// Setup Gin router
 	router := gin.New()
@@ -130,6 +153,10 @@ func main() {
 	router.GET("/health", rulesHandler.Health)
 	router.GET("/readyz", rulesHandler.Readyz)
 
+	// Identity / authorization — frontend calls this once at bootstrap to
+	// hydrate its authorization context (which UI elements to show/hide).
+	router.GET("/me", middleware.IdentityMiddleware(), iamHandler.Me)
+
 	// Static paths BEFORE parameterized routes to avoid conflicts
 	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)
 	router.GET("/rules/agg-analysis", analysisHandler.AggAnalysis)
@@ -144,10 +171,18 @@ func main() {
 
 	// Parameterized routes AFTER static paths
 	router.GET("/rules/:rule_id", rulesHandler.GetRule)
-	router.POST("/rules/:rule_id/prod", rulesHandler.PublishRule)
+	// Publish and delete are gated behind RequirePermission as the first two
+	// routes wired to the new RBAC layer — the highest-stakes rule mutations
+	// (publish activates a rule against live auth traffic; delete is
+	// irreversible). The rest of the router is intentionally left unguarded
+	// for now: retrofitting every existing endpoint changes the auth
+	// requirements for the entire current API surface, which is a broader
+	// decision than "build the reusable middleware" — flagged for a
+	// follow-up pass once you've reviewed this on the rbac branch.
+	router.POST("/rules/:rule_id/prod", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.PublishRule)
 	router.POST("/rules/:rule_id/status", rulesHandler.UpdateRuleStatus)
 	router.PUT("/rules/:rule_id", rulesHandler.UpdateRule)
-	router.DELETE("/rules/:rule_id", rulesHandler.DeleteRule)
+	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "delete"), rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 
 	// WebSocket routes
@@ -197,13 +232,11 @@ func main() {
 	// Close Kafka producer
 	services.CloseProducer()
 
-	// Close CSV store (drains write channels)
-	if csvStore != nil {
-		csvStore.Close()
-	}
-
 	// Close ClickHouse
 	services.CloseClickHouse()
+
+	// Close MySQL
+	services.CloseMySQL()
 
 	slog.Info("Server exited gracefully")
 }
