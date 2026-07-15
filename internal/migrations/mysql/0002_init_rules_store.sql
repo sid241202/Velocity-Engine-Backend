@@ -38,10 +38,13 @@ CREATE TABLE rules (
     anomaly_entity_field  VARCHAR(128) NULL,                   -- grouping.anomaly_entity_field
     grouping_keys         JSON NULL,                             -- grouping.keys, e.g. ["uid"]
     filters               JSON NULL,                               -- the full filter AND/OR tree — see design note above
+    penalty_ttl_seconds   INT NOT NULL DEFAULT 0,                    -- rule_metadata.penalty_ttl_seconds; lives here (not sink_configs) now that CSV parity no longer applies
+    active_guard          VARCHAR(128) GENERATED ALWAYS AS (IF(is_active, rule_id, NULL)) VIRTUAL,  -- DB-enforced "at most one active row per rule_id" — see uq_rules_one_active_per_rule below
     created_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_rules_rule_id_version (rule_id, version),
-    KEY idx_rules_rule_id_active (rule_id, is_active),
+    UNIQUE KEY uq_rules_one_active_per_rule (active_guard),
+    KEY idx_rules_active_rule_id (is_active, rule_id),
     KEY idx_rules_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -61,16 +64,14 @@ CREATE TABLE window_configs (
     CONSTRAINT fk_window_configs_rule FOREIGN KEY (rule_row_id) REFERENCES rules(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- One row per rule version. penalty_ttl_seconds is kept here rather than
--- on `rules`, matching the old sink_configs.csv's placement exactly even
--- though it's conceptually a rule_metadata field — preserving 1:1 CSV
--- parity rather than silently relocating it.
+-- One row per rule version. Mirrors sink_configs.csv, minus penalty_ttl_seconds
+-- (moved to `rules` — it's a rule_metadata field, not a sink toggle; kept here
+-- originally only for 1:1 CSV parity, which no longer applies).
 CREATE TABLE sink_configs (
     rule_row_id                 BIGINT UNSIGNED NOT NULL PRIMARY KEY,
     agg_sink_enabled            BOOLEAN NOT NULL DEFAULT FALSE,
     anomaly_sink_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     anomaly_store_sink_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
-    penalty_ttl_seconds         INT NOT NULL DEFAULT 0,
     CONSTRAINT fk_sink_configs_rule FOREIGN KEY (rule_row_id) REFERENCES rules(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -98,10 +99,15 @@ CREATE TABLE breach_conditions (
     KEY idx_breach_conditions_rule (rule_row_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Versioning semantics, enforced by internal/services/rule_store.go, not by
--- the schema itself (MySQL has no partial/conditional unique index, so "at
--- most one is_active=TRUE row per rule_id" is an application-maintained
--- invariant, always changed inside a transaction):
+-- Versioning semantics, enforced by internal/services/rule_store.go, and
+-- backstopped by the schema itself: MySQL 8 has no direct partial/conditional
+-- unique index, but `rules.active_guard` (a generated column that's NULL for
+-- every non-active row and equal to rule_id for the active one) plus
+-- uq_rules_one_active_per_rule gets the same effect — "at most one
+-- is_active=TRUE row per rule_id" is a real database constraint, not just an
+-- application-maintained invariant. The application still always changes
+-- is_active inside a transaction (below) — the constraint is a backstop
+-- against a bug or a race in that logic, not a substitute for it:
 --
 --   * A NEW VERSION (a fresh row in `rules` plus its four side-table rows)
 --     is created only when the rule's actual definition changes — a full

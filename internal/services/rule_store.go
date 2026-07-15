@@ -64,10 +64,11 @@ func SaveNewRuleVersion(ctx context.Context, rule *models.VelocityRule, version 
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO rules (rule_id, version, is_active, name, description, status, severity,
-			source_topic, entity_name, anomaly_entity_field, grouping_keys, filters)
-		VALUES (?, ?, TRUE, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_topic, entity_name, anomaly_entity_field, grouping_keys, filters, penalty_ttl_seconds)
+		VALUES (?, ?, TRUE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, ruleID, version, rule.RuleMetadata.RuleName, description, rule.RuleMetadata.Status, rule.RuleMetadata.SeverityLevel,
-		rule.ExecutionRouting.TargetSourceTopic, rule.Grouping.EntityName, rule.Grouping.AnomalyEntityField, groupingKeys, filtersJSON)
+		rule.ExecutionRouting.TargetSourceTopic, rule.Grouping.EntityName, rule.Grouping.AnomalyEntityField, groupingKeys, filtersJSON,
+		rule.RuleMetadata.PenaltyTTLSeconds)
 	if err != nil {
 		return fmt.Errorf("failed to insert new rule version: %w", err)
 	}
@@ -93,9 +94,9 @@ func SaveNewRuleVersion(ctx context.Context, rule *models.VelocityRule, version 
 		storeOn = rule.Sinks.AnomalyStoreSinkEnabled
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sink_configs (rule_row_id, agg_sink_enabled, anomaly_sink_enabled, anomaly_store_sink_enabled, penalty_ttl_seconds)
-		VALUES (?, ?, ?, ?, ?)
-	`, ruleRowID, aggOn, anomalyOn, storeOn, rule.RuleMetadata.PenaltyTTLSeconds); err != nil {
+		INSERT INTO sink_configs (rule_row_id, agg_sink_enabled, anomaly_sink_enabled, anomaly_store_sink_enabled)
+		VALUES (?, ?, ?, ?)
+	`, ruleRowID, aggOn, anomalyOn, storeOn); err != nil {
 		return fmt.Errorf("failed to insert sink config: %w", err)
 	}
 
@@ -177,11 +178,12 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 		anomalyEntityField string
 		groupingKeys       []byte
 		filters            []byte
+		penaltyTTLSeconds  int
 	}
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, rule_id, version, name, description, status, severity,
-			source_topic, entity_name, anomaly_entity_field, grouping_keys, filters
+			source_topic, entity_name, anomaly_entity_field, grouping_keys, filters, penalty_ttl_seconds
 		FROM rules WHERE is_active = TRUE
 	`)
 	if err != nil {
@@ -193,7 +195,7 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 		var entityName, anomalyEntityField sql.NullString
 		var groupingKeys, filters sql.RawBytes
 		if err := rows.Scan(&r.rowID, &r.ruleID, &r.version, &r.name, &r.description, &r.status, &r.severity,
-			&r.sourceTopic, &entityName, &anomalyEntityField, &groupingKeys, &filters); err != nil {
+			&r.sourceTopic, &entityName, &anomalyEntityField, &groupingKeys, &filters, &r.penaltyTTLSeconds); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("failed to scan rule row: %w", err)
 		}
@@ -249,21 +251,17 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 		return nil, fmt.Errorf("window_configs rows iteration error: %w", wRowsErr)
 	}
 
-	type sinkRow struct {
-		sinks             models.SinkConfig
-		penaltyTTLSeconds int
-	}
-	sinks := make(map[int64]sinkRow, len(ruleRows))
+	sinks := make(map[int64]models.SinkConfig, len(ruleRows))
 	sRows, err := db.QueryContext(ctx, `
-		SELECT rule_row_id, agg_sink_enabled, anomaly_sink_enabled, anomaly_store_sink_enabled, penalty_ttl_seconds
+		SELECT rule_row_id, agg_sink_enabled, anomaly_sink_enabled, anomaly_store_sink_enabled
 		FROM sink_configs WHERE rule_row_id IN `+inClause, rowIDs...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sink configs: %w", err)
 	}
 	for sRows.Next() {
 		var rowID int64
-		var s sinkRow
-		if err := sRows.Scan(&rowID, &s.sinks.AggSinkEnabled, &s.sinks.AnomalySinkEnabled, &s.sinks.AnomalyStoreSinkEnabled, &s.penaltyTTLSeconds); err != nil {
+		var s models.SinkConfig
+		if err := sRows.Scan(&rowID, &s.AggSinkEnabled, &s.AnomalySinkEnabled, &s.AnomalyStoreSinkEnabled); err != nil {
 			sRows.Close()
 			return nil, fmt.Errorf("failed to scan sink config: %w", err)
 		}
@@ -339,7 +337,7 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 				return nil, fmt.Errorf("failed to parse filters for rule %s: %w", r.ruleID, err)
 			}
 		}
-		s := sinks[r.rowID]
+		sinkConfig := sinks[r.rowID]
 
 		rule := models.VelocityRule{
 			RuleMetadata: models.RuleMetadata{
@@ -347,7 +345,7 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 				RuleName:          r.name,
 				Status:            r.status,
 				SeverityLevel:     r.severity,
-				PenaltyTTLSeconds: s.penaltyTTLSeconds,
+				PenaltyTTLSeconds: r.penaltyTTLSeconds,
 			},
 			ExecutionRouting: models.ExecutionRouting{TargetSourceTopic: r.sourceTopic},
 			Filters:          filters,
@@ -359,7 +357,7 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 			Windowing:        windows[r.rowID],
 			Aggregations:     aggs[r.rowID],
 			HavingThresholds: models.HavingThresholds{Expression: breaches[r.rowID]},
-			Sinks:            &s.sinks,
+			Sinks:            &sinkConfig,
 		}
 
 		payload, err := json.Marshal(rule)

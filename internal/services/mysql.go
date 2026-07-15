@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 
@@ -48,6 +49,8 @@ func getMySQLDB() (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(config.MySQLMaxOpenConns)
 	db.SetMaxIdleConns(config.MySQLMaxIdleConns)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute) // proactively recycle idle conns before server kills them — mirrors getClickHouseDB
 
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
