@@ -68,6 +68,21 @@ var (
 	// internal/middleware/auth.go. Guarded below: refuses to boot with this on
 	// in a prod environment, mirroring the existing S3 key check in init().
 	AuthDevMode = getEnv("AUTH_DEV_MODE", "true") == "true"
+
+	// AuthMode selects which IdentityMiddleware code path runs: "dev" (the
+	// X-Debug-User-Id shim, still gated by AuthDevMode below) or "wso2" (real
+	// JWKS-verified bearer tokens). Kept distinct from AuthDevMode rather than
+	// inferring one from the other, so the existing AuthDevMode/ENV=prod boot
+	// panic keeps working unchanged regardless of how AuthMode is wired up.
+	AuthMode = getEnv("AUTH_MODE", "dev")
+
+	// WSO2 / OIDC config — used only when AuthMode == "wso2". Defaults mirror
+	// the frontend's src/config/appConfig.js authConfig.metadata block (same
+	// WSO2 tenant).
+	WSO2JWKSURI         = getEnv("WSO2_JWKS_URI", "https://sso.uidai.net.in/oauth2/jwks")
+	WSO2Issuer          = getEnv("WSO2_ISSUER", "https://sso.uidai.net.in/oauth2")
+	WSO2Audience        = getEnv("WSO2_AUDIENCE", "") // required in "wso2" mode — no safe default
+	JWTClockSkewSeconds = getEnvInt("JWT_CLOCK_SKEW_SECONDS", 60)
 )
 
 func init() {
@@ -82,6 +97,12 @@ func init() {
 		// AuthDevMode bypasses real identity verification (see
 		// internal/middleware/auth.go) — it must never be reachable in prod.
 		panic("AUTH_DEV_MODE must be false (or unset) when ENV=prod — it is a pre-WSO2 development identity bypass")
+	}
+	if AuthMode == "wso2" && WSO2Audience == "" {
+		// A missing audience would otherwise fail every single request at
+		// verification time instead of at boot — panic here mirrors the
+		// S3/AuthDevMode checks above.
+		panic("WSO2_AUDIENCE is required when AUTH_MODE=wso2")
 	}
 }
 

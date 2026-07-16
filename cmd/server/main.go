@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -89,6 +90,19 @@ func main() {
 		}
 	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
+
+	// Wires the "wso2" AuthMode path (no-op if AuthMode is "dev"). The
+	// not-found translation here is the one place services.ErrUserNotFound
+	// and middleware.ErrIdentityNotFound meet — see both sentinels' doc
+	// comments for why internal/middleware doesn't import internal/services
+	// directly.
+	middleware.SetWSO2Dependencies(services.ValidateWSO2Token, func(ctx context.Context, sub string) (int64, string, error) {
+		userID, status, err := services.GetUserByExternalSubject(ctx, sub)
+		if errors.Is(err, services.ErrUserNotFound) {
+			return 0, "", middleware.ErrIdentityNotFound
+		}
+		return userID, status, err
+	})
 
 	// Create handlers
 	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)

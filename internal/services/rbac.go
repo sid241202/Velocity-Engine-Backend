@@ -158,6 +158,32 @@ func fetchUserPermissionsFromDB(ctx context.Context, userID int64) (roles []stri
 	return roles, perms, nil
 }
 
+// GetUserByExternalSubject resolves a WSO2/OIDC "sub" claim to this system's
+// local users.id + status, via the external_subject column that schema was
+// designed for (see 0001_init_rbac.sql). Used only by IdentityMiddleware's
+// "wso2" path — the dev-mode X-Debug-User-Id shim already carries a local
+// user ID directly and never needs this lookup.
+//
+// Deliberately does NOT auto-create a user row on a miss: ErrUserNotFound
+// here means "reject the request," matching the reference operator360
+// backend's deny-until-provisioned behavior — an admin must have already
+// created this user via the existing manual MySQL provisioning process.
+func GetUserByExternalSubject(ctx context.Context, sub string) (userID int64, status string, err error) {
+	db, err := getMySQLDB()
+	if err != nil {
+		return 0, "", fmt.Errorf("mysql unavailable: %w", err)
+	}
+
+	err = db.QueryRowContext(ctx, "SELECT id, status FROM users WHERE external_subject = ?", sub).Scan(&userID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", ErrUserNotFound
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to look up user by external_subject: %w", err)
+	}
+	return userID, status, nil
+}
+
 // RecordAuditEvent inserts one audit_log row. actorUserID is nil for
 // system-initiated actions. Not currently called from any request path in
 // this task — it's wired up ready for the future admin endpoints that grant/
