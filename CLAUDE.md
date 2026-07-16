@@ -46,9 +46,18 @@ guard is intentional, don't relax it.
 
 ## Branches
 
-- `release` — stable/demo branch.
-- `rbac` — current RBAC work, cut from `release`, **not yet merged back**
-  (explicitly deferred by the user).
+- `release` — stable/demo branch. As of 2026-07-16, has the full RBAC +
+  normalized-MySQL-rule-store surface merged in (`--no-ff` merge commit
+  `c2910c2`) — this is no longer separate feature work, it's what `release`
+  actually runs.
+- `rbac+persistentStore` — the branch this work was developed on (RBAC +
+  the MySQL rule store, cut from a now-deleted `rbac` branch). Already
+  merged into `release`; kept around rather than deleted.
+- The original `rbac` branch (RBAC-only, predating the MySQL rule store)
+  was superseded by `rbac+persistentStore` and deleted 2026-07-16, both
+  locally and on `github`, at the user's explicit request — its full
+  history is preserved via `rbac+persistentStore`'s ancestry, nothing was
+  lost.
 
 ## Local build/test — known toolchain limitation
 
