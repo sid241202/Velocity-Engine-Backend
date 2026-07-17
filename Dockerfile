@@ -14,7 +14,7 @@
 #HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s CMD wget -qO- http://localhost:8000/health || exit 1
 #ENTRYPOINT ["/server"]
 
-FROM harbor-registry-non-prod.uidai.gov.in/devops/golang:1.23.3-ubuntu_jammy-gcc-git AS build
+FROM mndc-harbor-registry-non-prod.uidai.net.in/devops/golang:1.23.3-ubuntu22-gcc-git AS build
 
 # Set module mode + proxy rules
 ENV GO111MODULE=on \
@@ -35,7 +35,7 @@ RUN chmod +x /usr/local/bin/cyclonedx-gomod
 
 RUN cyclonedx-gomod app -json -output /SCA-bom.json  -main cmd/server .
 
-FROM harbor-registry-non-prod.uidai.gov.in/devops/golang:1.23.3-ubuntu_jammy-gcc-git
+FROM mndc-harbor-registry-non-prod.uidai.net.in/devops/golang:1.23.3-ubuntu22-gcc-git
 
 # Create User
 RUN useradd -ms /bin/bash uidapp
