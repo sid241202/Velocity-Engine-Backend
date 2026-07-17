@@ -7,8 +7,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"velocity-engine-control-plane-backend-go/internal/config"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -16,14 +14,13 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// devModeForTest sets config.AuthDevMode for the duration of a test and
-// returns a func that restores the prior value — config.AuthDevMode is a
-// mutable package-level var (read directly by IdentityMiddleware), so tests
-// toggle it directly rather than needing a separate injectable flag.
-func devModeForTest(enabled bool) func() {
-	prev := config.AuthDevMode
-	config.AuthDevMode = enabled
-	return func() { config.AuthDevMode = prev }
+// wso2DepsForTest wires fake WSO2TokenValidator/ExternalSubjectResolver
+// functions for the duration of a test and returns a func that clears them —
+// mirrors the real SetWSO2Dependencies call cmd/server makes at startup,
+// but with fakes so these tests need neither a real WSO2 tenant nor MySQL.
+func wso2DepsForTest(validator WSO2TokenValidator, resolver ExternalSubjectResolver) func() {
+	SetWSO2Dependencies(validator, resolver)
+	return func() { SetWSO2Dependencies(nil, nil) }
 }
 
 func newTestRouter(resolver PermissionResolver, resource, action string, setUserID interface{}) *gin.Engine {
@@ -101,9 +98,11 @@ func TestRequirePermission_ServiceUnavailableOnResolverError(t *testing.T) {
 	}
 }
 
-func TestIdentityMiddleware_DevModeResolvesHeader(t *testing.T) {
-	origDevMode := devModeForTest(true)
-	defer origDevMode()
+func TestIdentityMiddleware_ValidTokenResolvesUser(t *testing.T) {
+	defer wso2DepsForTest(
+		func(ctx context.Context, rawToken string) (string, error) { return "wso2-subject-42", nil },
+		func(ctx context.Context, sub string) (int64, string, error) { return 42, "ACTIVE", nil },
+	)()
 
 	r := gin.New()
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) {
@@ -112,7 +111,7 @@ func TestIdentityMiddleware_DevModeResolvesHeader(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("X-Debug-User-Id", "7")
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -121,9 +120,17 @@ func TestIdentityMiddleware_DevModeResolvesHeader(t *testing.T) {
 	}
 }
 
-func TestIdentityMiddleware_MissingHeaderRejected(t *testing.T) {
-	origDevMode := devModeForTest(true)
-	defer origDevMode()
+func TestIdentityMiddleware_MissingBearerHeaderRejected(t *testing.T) {
+	defer wso2DepsForTest(
+		func(ctx context.Context, rawToken string) (string, error) {
+			t.Fatal("validator must not be called without a bearer header")
+			return "", nil
+		},
+		func(ctx context.Context, sub string) (int64, string, error) {
+			t.Fatal("resolver must not be called without a bearer header")
+			return 0, "", nil
+		},
+	)()
 
 	r := gin.New()
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -137,15 +144,76 @@ func TestIdentityMiddleware_MissingHeaderRejected(t *testing.T) {
 	}
 }
 
-func TestIdentityMiddleware_DisabledOutsideDevMode(t *testing.T) {
-	origDevMode := devModeForTest(false)
-	defer origDevMode()
+func TestIdentityMiddleware_InvalidTokenRejected(t *testing.T) {
+	defer wso2DepsForTest(
+		func(ctx context.Context, rawToken string) (string, error) {
+			return "", errors.New("signature verification failed")
+		},
+		func(ctx context.Context, sub string) (int64, string, error) {
+			t.Fatal("resolver must not be called when token validation fails")
+			return 0, "", nil
+		},
+	)()
 
 	r := gin.New()
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("X-Debug-User-Id", "7") // present but must be ignored — dev mode is off
+	req.Header.Set("Authorization", "Bearer forged.token.here")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
+	defer wso2DepsForTest(
+		func(ctx context.Context, rawToken string) (string, error) { return "never-seen-before", nil },
+		func(ctx context.Context, sub string) (int64, string, error) { return 0, "", ErrIdentityNotFound },
+	)()
+
+	r := gin.New()
+	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestIdentityMiddleware_DisabledUserRejected(t *testing.T) {
+	defer wso2DepsForTest(
+		func(ctx context.Context, rawToken string) (string, error) { return "wso2-subject-42", nil },
+		func(ctx context.Context, sub string) (int64, string, error) { return 42, "DISABLED", nil },
+	)()
+
+	r := gin.New()
+	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestIdentityMiddleware_NotConfiguredWithoutDependencies(t *testing.T) {
+	defer wso2DepsForTest(nil, nil)()
+
+	r := gin.New()
+	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

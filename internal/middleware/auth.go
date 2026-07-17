@@ -8,10 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
-
-	"velocity-engine-control-plane-backend-go/internal/config"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,8 +33,8 @@ type ExternalSubjectResolver func(ctx context.Context, sub string) (userID int64
 // "reject, not provisioned" (401) from a genuine resolver failure (503).
 var ErrIdentityNotFound = errors.New("identity not found")
 
-// wso2Validator/wso2Resolver back the "wso2" AuthMode path. Set once at
-// startup via SetWSO2Dependencies — injected rather than imported directly
+// wso2Validator/wso2Resolver back IdentityMiddleware. Set once at startup
+// via SetWSO2Dependencies — injected rather than imported directly
 // (internal/services is not imported by this package at all) for the same
 // reason PermissionResolver below is injected: internal/services pulls in
 // go-duckdb (cgo) via duckdb.go, and this package needs to stay buildable/
@@ -47,84 +44,34 @@ var (
 	wso2Resolver  ExternalSubjectResolver
 )
 
-// SetWSO2Dependencies wires the "wso2" AuthMode path. Call once at startup
-// (cmd/server, which already imports internal/services for
-// NewAuthMiddleware) — a no-op if AuthMode is "dev".
+// SetWSO2Dependencies wires IdentityMiddleware's real dependencies. Call
+// once at startup (cmd/server, which already imports internal/services for
+// NewAuthMiddleware).
 func SetWSO2Dependencies(validator WSO2TokenValidator, resolver ExternalSubjectResolver) {
 	wso2Validator = validator
 	wso2Resolver = resolver
 }
 
-// IdentityMiddleware resolves the current request's user ID and stores it in
-// the gin context under ContextKeyUserID. Branches on config.AuthMode:
+// IdentityMiddleware resolves the current request's user ID and stores it
+// in the gin context under ContextKeyUserID. This branch is WSO2-only — no
+// dev-mode identity shim exists here and there is no config toggle back to
+// one; see uid-dp-velocity-engine-control-plane-frontend/CLAUDE.md and this
+// repo's own CLAUDE.md if a dev fallback is ever needed again, since the
+// `demo` branch (this branch's parent) still has one.
 //
-//   - "wso2": real identity. Validates the Authorization: Bearer token against
-//     WSO2's JWKS (wso2Validator — real signature verification, not a
-//     decode-only check), then resolves the token's "sub" claim to a local
-//     users.id via wso2Resolver. An unrecognized subject is rejected (401),
-//     not auto-provisioned — matching the deny-until-provisioned model
-//     confirmed in the demo-wso2 plan's reference-backend research; admins
-//     still create users/user_roles rows manually, same as before.
-//   - "dev": the TEMPORARY pre-WSO2 identity shim — a plain X-Debug-User-Id
-//     header, gated by config.AuthDevMode (which config.go's boot-time panic
-//     already refuses to allow when ENV=prod). Kept, deliberately, as a local
-//     dev/demo fallback for when a live WSO2 instance isn't reachable.
-//
-// Any other/unset AuthMode is a deployment misconfiguration, not a request
-// error — respond 501, not 401.
+// Validates the Authorization: Bearer token against WSO2's JWKS
+// (wso2Validator — real signature verification, not a decode-only check),
+// then resolves the token's "sub" claim to a local users.id via
+// wso2Resolver. An unrecognized subject is rejected (401), not
+// auto-provisioned — matching the deny-until-provisioned model confirmed in
+// the demo-wso2 plan's reference-backend research; admins still create
+// users/user_roles rows manually.
 func IdentityMiddleware() gin.HandlerFunc {
-	switch config.AuthMode {
-	case "wso2":
-		return wso2IdentityMiddleware()
-	case "dev":
-		return devIdentityMiddleware()
-	default:
-		return func(c *gin.Context) {
-			c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{
-				"detail": "Authentication is not yet configured on this deployment",
-			})
-		}
-	}
-}
-
-// devIdentityMiddleware is the TEMPORARY pre-WSO2 identity shim described
-// above. Not a real auth mechanism — see IdentityMiddleware's doc comment.
-func devIdentityMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if !config.AuthDevMode {
-			c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{
-				"detail": "Authentication is not yet configured on this deployment",
-			})
-			return
-		}
-
-		raw := c.GetHeader("X-Debug-User-Id")
-		if raw == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"detail": "Missing X-Debug-User-Id (development identity header)",
-			})
-			return
-		}
-		userID, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "Invalid X-Debug-User-Id"})
-			return
-		}
-
-		c.Set(ContextKeyUserID, userID)
-		c.Next()
-	}
-}
-
-// wso2IdentityMiddleware validates a real WSO2-issued bearer token and
-// resolves its subject to a local user. See IdentityMiddleware's doc comment.
-func wso2IdentityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if wso2Validator == nil || wso2Resolver == nil {
 			// Deployment wiring bug (SetWSO2Dependencies was never called),
-			// not a request error — respond the same way as an unconfigured
-			// AuthMode rather than panicking on a nil function call.
-			slog.Error("AuthMode=wso2 but SetWSO2Dependencies was never called")
+			// not a request error.
+			slog.Error("IdentityMiddleware used before SetWSO2Dependencies was called")
 			c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{
 				"detail": "Authentication is not yet configured on this deployment",
 			})

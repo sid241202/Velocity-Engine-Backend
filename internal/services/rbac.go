@@ -160,9 +160,8 @@ func fetchUserPermissionsFromDB(ctx context.Context, userID int64) (roles []stri
 
 // GetUserByExternalSubject resolves a WSO2/OIDC "sub" claim to this system's
 // local users.id + status, via the external_subject column that schema was
-// designed for (see 0001_init_rbac.sql). Used only by IdentityMiddleware's
-// "wso2" path — the dev-mode X-Debug-User-Id shim already carries a local
-// user ID directly and never needs this lookup.
+// designed for (see 0001_init_rbac.sql). Used by IdentityMiddleware — this
+// branch's only identity path.
 //
 // Deliberately does NOT auto-create a user row on a miss: ErrUserNotFound
 // here means "reject the request," matching the reference operator360

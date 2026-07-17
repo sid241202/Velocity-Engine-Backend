@@ -1,6 +1,6 @@
-// Package services — WSO2 JWT validation. Only active when config.AuthMode
-// == "wso2"; the "dev" path (internal/middleware/auth.go's X-Debug-User-Id
-// shim) never calls into this file.
+// Package services — WSO2 JWT validation, wired into
+// internal/middleware.IdentityMiddleware via SetWSO2Dependencies (this
+// branch's only identity path — see that function's doc comment).
 package services
 
 import (

@@ -91,7 +91,8 @@ func main() {
 	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
-	// Wires the "wso2" AuthMode path (no-op if AuthMode is "dev"). The
+	// Wires IdentityMiddleware's real WSO2 dependencies (this branch is
+	// WSO2-only — see middleware.IdentityMiddleware's doc comment). The
 	// not-found translation here is the one place services.ErrUserNotFound
 	// and middleware.ErrIdentityNotFound meet — see both sentinels' doc
 	// comments for why internal/middleware doesn't import internal/services

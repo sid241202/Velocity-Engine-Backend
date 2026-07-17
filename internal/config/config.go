@@ -7,10 +7,15 @@ import (
 
 var (
 	// Server
-	ServerHost  = getEnv("SERVER_HOST", "0.0.0.0")
-	ServerPort  = getEnv("SERVER_PORT", "8000")
-	LogLevel    = getEnv("LOG_LEVEL", "INFO")
-	CORSOrigins = getEnv("CORS_ORIGINS", "*")
+	ServerHost = getEnv("SERVER_HOST", "0.0.0.0")
+	ServerPort = getEnv("SERVER_PORT", "8000")
+	LogLevel   = getEnv("LOG_LEVEL", "INFO")
+	// CORSOrigins: comma-separated allow-list (see cmd/server/main.go's CORS
+	// wiring). Defaults to this app's actual staging frontend origin (raw
+	// IP:port, no DNS name — see appConfig.js's authConfig comment for the
+	// same address) rather than "*", now that a real origin is known for
+	// this branch; override via CORS_ORIGINS for any other environment.
+	CORSOrigins = getEnv("CORS_ORIGINS", "http://10.10.79.27:32515")
 
 	// Kafka
 	KafkaBrokers         = getEnv("KAFKA_BROKERS", "localhost:9092")
@@ -63,25 +68,14 @@ var (
 	// exposure — so staleness is tolerated only up to this bound, after which
 	// authorization checks fail closed (503) instead of trusting old data forever.
 	RBACPermissionMaxStaleSeconds = getEnvInt("RBAC_PERMISSION_MAX_STALE_SECONDS", 1800)
-	// AuthDevMode enables the TEMPORARY pre-WSO2 identity shim (X-Debug-User-Id
-	// header) used until real token validation is implemented. See
-	// internal/middleware/auth.go. Guarded below: refuses to boot with this on
-	// in a prod environment, mirroring the existing S3 key check in init().
-	AuthDevMode = getEnv("AUTH_DEV_MODE", "true") == "true"
 
-	// AuthMode selects which IdentityMiddleware code path runs: "dev" (the
-	// X-Debug-User-Id shim, still gated by AuthDevMode below) or "wso2" (real
-	// JWKS-verified bearer tokens). Kept distinct from AuthDevMode rather than
-	// inferring one from the other, so the existing AuthDevMode/ENV=prod boot
-	// panic keeps working unchanged regardless of how AuthMode is wired up.
-	AuthMode = getEnv("AUTH_MODE", "dev")
-
-	// WSO2 / OIDC config — used only when AuthMode == "wso2". Defaults mirror
-	// the frontend's src/config/appConfig.js authConfig.metadata block (same
-	// WSO2 tenant).
+	// WSO2 / OIDC config. This branch is WSO2-only — there is no dev-mode
+	// identity shim and no config toggle back to one (see
+	// internal/middleware/auth.go). Defaults mirror the frontend's
+	// src/config/appConfig.js authConfig.metadata block (same WSO2 tenant).
 	WSO2JWKSURI         = getEnv("WSO2_JWKS_URI", "https://sso.uidai.net.in/oauth2/jwks")
 	WSO2Issuer          = getEnv("WSO2_ISSUER", "https://sso.uidai.net.in/oauth2")
-	WSO2Audience        = getEnv("WSO2_AUDIENCE", "") // required in "wso2" mode — no safe default
+	WSO2Audience        = getEnv("WSO2_AUDIENCE", "") // no safe default — required, see init() below
 	JWTClockSkewSeconds = getEnvInt("JWT_CLOCK_SKEW_SECONDS", 60)
 )
 
@@ -93,16 +87,12 @@ func init() {
 			panic("S3_ACCESS_KEY and S3_SECRET_KEY are required")
 		}
 	}
-	if AuthDevMode && os.Getenv("ENV") == "prod" {
-		// AuthDevMode bypasses real identity verification (see
-		// internal/middleware/auth.go) — it must never be reachable in prod.
-		panic("AUTH_DEV_MODE must be false (or unset) when ENV=prod — it is a pre-WSO2 development identity bypass")
-	}
-	if AuthMode == "wso2" && WSO2Audience == "" {
+	if WSO2Audience == "" {
 		// A missing audience would otherwise fail every single request at
 		// verification time instead of at boot — panic here mirrors the
-		// S3/AuthDevMode checks above.
-		panic("WSO2_AUDIENCE is required when AUTH_MODE=wso2")
+		// S3 check above. Unconditional: this branch has no other identity
+		// path to fall back to.
+		panic("WSO2_AUDIENCE is required")
 	}
 }
 
