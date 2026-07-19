@@ -13,7 +13,6 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/handlers"
-	"velocity-engine-control-plane-backend-go/internal/middleware"
 	"velocity-engine-control-plane-backend-go/internal/services"
 
 	"github.com/gin-contrib/cors"
@@ -73,8 +72,6 @@ func main() {
 	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
 	anomalyConsumer.Start()
 
-	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
-
 	// Create handlers. rulesDB starts empty — this branch has no persistence
 	// layer behind it (see internal/handlers/rules.go), and demo is not
 	// expected to survive a process restart.
@@ -82,7 +79,6 @@ func main() {
 
 	analysisHandler := handlers.NewAnalysisHandler(liveStore, anomalyStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
-	iamHandler := handlers.NewIAMHandler()
 
 	// Setup Gin router
 	router := gin.New()
@@ -129,10 +125,6 @@ func main() {
 	router.GET("/health", rulesHandler.Health)
 	router.GET("/readyz", rulesHandler.Readyz)
 
-	// Identity / authorization — frontend calls this once at bootstrap to
-	// hydrate its authorization context (which UI elements to show/hide).
-	router.GET("/me", middleware.IdentityMiddleware(), iamHandler.Me)
-
 	// Static paths BEFORE parameterized routes to avoid conflicts
 	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)
 	router.GET("/rules/agg-analysis", analysisHandler.AggAnalysis)
@@ -147,18 +139,12 @@ func main() {
 
 	// Parameterized routes AFTER static paths
 	router.GET("/rules/:rule_id", rulesHandler.GetRule)
-	// Publish and delete are gated behind RequirePermission as the first two
-	// routes wired to the new RBAC layer — the highest-stakes rule mutations
-	// (publish activates a rule against live auth traffic; delete is
-	// irreversible). The rest of the router is intentionally left unguarded
-	// for now: retrofitting every existing endpoint changes the auth
-	// requirements for the entire current API surface, which is a broader
-	// decision than "build the reusable middleware" — flagged for a
-	// follow-up pass once you've reviewed this on the rbac branch.
-	router.POST("/rules/:rule_id/prod", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.PublishRule)
+	// No auth/permission gating anywhere on this branch — demo is a fully
+	// open, single-implicit-user application (see this repo's CLAUDE.md).
+	router.POST("/rules/:rule_id/prod", rulesHandler.PublishRule)
 	router.POST("/rules/:rule_id/status", rulesHandler.UpdateRuleStatus)
 	router.PUT("/rules/:rule_id", rulesHandler.UpdateRule)
-	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "delete"), rulesHandler.DeleteRule)
+	router.DELETE("/rules/:rule_id", rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 
 	// WebSocket routes

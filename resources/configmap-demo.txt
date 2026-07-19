@@ -6,14 +6,16 @@
 # sensitive (credentials/keys), or the app panics at boot without it — and
 # is never a real value copied from any local .env/config.
 #
-# No MYSQL_* keys: this branch's RBAC/rule storage is in-memory, not MySQL
-# (see internal/services/rbac.go and internal/handlers/rules.go).
+# No MYSQL_* keys: this branch's rule storage is in-memory, not MySQL (see
+# internal/handlers/rules.go). No RBAC_*/AUTH_DEV_MODE keys either: this
+# branch has no auth/identity/RBAC layer of any kind (see CLAUDE.md) —
+# every request is treated as a single implicit user.
 
 SERVER_HOST=0.0.0.0  # HTTP server bind host
 SERVER_PORT=8000  # HTTP server bind port
 LOG_LEVEL=INFO  # structured log verbosity: DEBUG, INFO, WARN, or ERROR
 CORS_ORIGINS=*  # comma-separated allowed CORS origins for the frontend ("*" = allow all, no credentials)
-ENV=  # deployment mode; ENV=prod enables strict boot-time checks (AUTH_DEV_MODE must be off, S3 keys become required); unset/other = non-strict
+ENV=  # deployment mode; ENV=prod enables strict boot-time checks (S3 keys become required); unset/other = non-strict
 
 KAFKA_BROKERS=localhost:9092  # Kafka broker list (comma-separated host:port)
 RULES_TOPIC=DE.AUTH.VELOCITY_ENGINE.RULES  # Kafka topic rule definitions are broadcast on
@@ -39,7 +41,3 @@ ICEBERG_S3_PATH=s3://warehouse/stream_auth.db/auth_txn_raw_union_v1  # S3 path t
 LIVE_STORE_MAX_ROWS=50000  # max rows retained in the in-memory LiveStore
 LIVE_STORE_HOURS=24  # hours of history the LiveStore bootstraps from ClickHouse at startup
 WS_HEARTBEAT_INTERVAL=30  # WebSocket heartbeat/ping interval, in seconds
-
-RBAC_PERMISSION_CACHE_TTL_SECONDS=300  # seconds a resolved (roles, permissions) set is cached before re-resolving
-RBAC_PERMISSION_MAX_STALE_SECONDS=1800  # max seconds a cached permission set may be served past its TTL during a resolution failure, before failing closed
-AUTH_DEV_MODE=true  # enables the pre-WSO2 X-Debug-User-Id identity shim; must be false when ENV=prod (panics at boot otherwise)

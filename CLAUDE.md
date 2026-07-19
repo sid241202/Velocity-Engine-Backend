@@ -14,61 +14,55 @@ to this repo.
   `read_parquet()` glob (manifest-level pruning, snapshot isolation,
   delete-file handling).
 - **No MySQL, no `database/sql` driver, on this branch** (removed
-  2026-07-20 — see RBAC section below). `release` still uses MySQL; don't
-  assume this branch matches it.
+  2026-07-20). `release` still uses MySQL; don't assume this branch matches
+  it.
+- **No auth/identity/RBAC layer of any kind, on this branch** (removed
+  2026-07-20 — see below). Every request is treated as a single implicit
+  user. `release` has real WSO2/OIDC auth + RBAC; don't assume this branch
+  matches it, and don't port anything from it here without being asked.
 
 ## Config
 
 All configuration lives in `internal/config/config.go` — Kafka, ClickHouse,
-Iceberg/S3, LiveStore, RBAC cache tuning, `AuthDevMode`. Don't add another
-config file — extend this one. `config.go`'s `init()` panics if
-`AuthDevMode` (or a missing S3 key) would be live with `ENV=prod` — that
-guard is intentional, don't relax it. No MySQL config keys exist here
-anymore (`MySQLHost`/`Port`/`User`/`Password`/`Database`/`MaxOpenConns`/
-`MaxIdleConns` all removed alongside the driver).
+Iceberg/S3, LiveStore. Don't add another config file — extend this one. No
+MySQL config keys exist here (`MySQLHost`/`Port`/`User`/`Password`/
+`Database`/`MaxOpenConns`/`MaxIdleConns`), and no RBAC/auth config keys
+either (`RBACPermissionCacheTTLSeconds`/`RBACPermissionMaxStaleSeconds`/
+`AuthDevMode` all removed alongside the auth layer — see below).
 
-## RBAC and rule storage (backend half) — in-memory, zero MySQL
+## No auth/RBAC — demo is a fully open, single-implicit-user application
 
-As of 2026-07-20, this branch runs with **zero MySQL tables provisioned** —
-both the RBAC store and the rule store were converted from MySQL-backed to
-purely in-memory. This was a storage-layer swap only: the X-Debug-User-Id
-identity flow, the resource:action permission model, and rule CRUD
-semantics are all unchanged from before. `release` (a separately-diverged
-branch) still uses MySQL for both — don't assume parity.
+As of 2026-07-20, this branch has **no auth layer at all** — not a
+lighter-weight identity, not the previous `X-Debug-User-Id` debug shim with
+checks removed, but no concept of "who is asking" anywhere in the code.
+Every route is reachable with no headers, no token, nothing. This is a
+deliberate decision for this branch, not an oversight: `release` (a
+separately-diverged branch) has real WSO2/OIDC auth + RBAC — don't assume
+parity, and don't resurrect identity resolution here without being asked.
 
-- `internal/services/rbac.go` — `rolePermissions` (the four roles × ten
-  permissions grant matrix) and `demoUsers` (one fixed seeded user per
-  role, ids 1–4) replace the old `users`/`roles`/`permissions`/`user_roles`/
-  `role_permissions` MySQL tables and `0001_init_rbac.sql`. Both are
-  read-only after package init (no admin endpoints mutate them), so neither
-  needs a mutex — unlike `permCache` in the same file, which is genuinely
-  request-concurrent and stays mutex-guarded. `GetUserPermissions`'s public
-  behavior (TTL cache, stale-serving fail-tolerant window, then fail-closed)
-  is unchanged; only the underlying fetch (`fetchUserPermissionsFromMemory`,
-  was `fetchUserPermissionsFromDB`) changed. Permission keys are still
-  `resource:action` strings (e.g. `rules:publish`) and must still match
-  `frontend/src/permissions.js` exactly.
-- `internal/middleware/auth.go` — `IdentityMiddleware` (`X-Debug-User-Id`
-  pre-WSO2 shim, disabled outside `AuthDevMode`) and
-  `RequirePermission(resource, action)` — unchanged by the storage swap.
-  `internal/handlers/iam.go` — `GET /me`.
-- `internal/handlers/rules.go` — `RulesHandler.rulesDB` (a
-  `map[string]*models.RuleRecord` guarded by `RulesHandler.mu
-  sync.RWMutex`) is now the **sole** rule store, not just a request-serving
-  cache in front of MySQL. There is no persistence layer behind it and no
-  reload-on-restart — **demo does not survive a process restart**, which is
-  an accepted, correct design here (not a shortcut): rulesDB starts empty
-  every time the process starts. `internal/services/rule_store.go`
-  (`SaveNewRuleVersion`/`UpdateRuleStatusInPlace`/`LoadActiveRules`),
-  `internal/services/mysql.go`, `internal/migrations/mysql/*.sql`, and the
-  now-fully-unused `internal/store` package (rule name/description
-  generation, only ever called from the removed rule store) were all
-  deleted outright rather than kept dead.
-- Test coverage: `internal/services/rbac_memory_test.go` replaces
-  `rbac_mysql_integration_test.go` (which required a real MySQL instance
-  behind a `mysql_integration` build tag) — covers the same guarantees
-  (seed-data shape, per-role grants, end-to-end permission resolution)
-  against the in-memory store, runs unconditionally under `go test ./...`.
+Deleted entirely (not kept as no-ops, so the code path doesn't exist to be
+misread later): `internal/middleware/auth.go` + `auth_test.go`
+(`IdentityMiddleware`, `RequirePermission`, `AuthMiddleware`),
+`internal/services/rbac.go` + its tests (`GetUserPermissions`, the seeded
+`demoUsers`/`rolePermissions` in-memory store this branch briefly had
+between 2026-07-20's two changes today), `internal/handlers/iam.go` (`GET
+/me`), and `internal/models/rbac.go` (`User`/`Role`/`Permission`/
+`AuditLogEntry`/`MeResponse` — already-orphaned MySQL-table-mirroring
+structs once `GET /me` was removed). `cmd/server/main.go` no longer
+constructs an `AuthMiddleware` or `IAMHandler`, and no route anywhere calls
+`IdentityMiddleware()` or `RequirePermission(...)`.
+
+No route's business logic actually depended on "which user" beyond the
+auth check itself (`internal/models/rule.go`'s `RuleRecord` has no
+created-by/updated-by field) — so there was nothing to backfill with a
+fixed "demo-user" constant.
+
+`internal/handlers/rules.go` — `RulesHandler.rulesDB` (a
+`map[string]*models.RuleRecord` guarded by `RulesHandler.mu
+sync.RWMutex`) is unaffected by this change and remains the sole rule
+store: purely in-memory, no persistence layer, no reload-on-restart.
+**Demo does not survive a process restart** — an accepted, correct design
+here, not a shortcut.
 
 ## Branches
 
@@ -76,10 +70,8 @@ branch) still uses MySQL for both — don't assume parity.
   WSO2/OIDC auth. Deliberately diverged from `demo` — verify `release`'s
   own `CLAUDE.md` and code directly rather than assuming parity with this
   file.
-- `demo` (this branch) — in-memory RBAC + rule store (see above), still
-  uses the pre-WSO2 `X-Debug-User-Id` identity shim (not WSO2 — that
-  migration is explicitly out of scope for this branch, needs separate
-  sign-off). Not merged into `release`.
+- `demo` (this branch) — in-memory rule store, no auth/RBAC/identity layer
+  at all (see above). Not merged into `release`.
 
 ## Local build/test — known toolchain limitation
 
@@ -95,7 +87,7 @@ it as a side effect of an unrelated task without being asked.
 **Verification pattern that works around it** (used successfully throughout
 this engagement):
 1. `go vet ./...` and `go build` on **non-cgo-dependent** packages (e.g.
-   `internal/middleware`) — these fully build, link, and run.
+   `internal/config`, `internal/handlers`) — these fully build, link, and run.
 2. `go vet ./...` on the whole module — this succeeds even for the
    `internal/services`/`cmd/server` packages, because `vet` type-checks
    without linking. Use this to prove compile-correctness of cgo-touching
@@ -106,7 +98,7 @@ this engagement):
 4. For real `go test` execution of logic inside `internal/services` (which
    can't fully build+link locally), copy the pure-Go logic under test into
    an isolated, cgo-free scratchpad Go module and `go test` it there. This
-   has been done successfully for LiveStore and RBAC cache logic.
+   has been done successfully for LiveStore.
 5. A system-wide Go toolchain isn't on `PATH` in this environment. A
    portable Go 1.23.3 was downloaded once and is kept at
    `E:\Projects\.claude\tools\go1.23.3` (durable — survives across
