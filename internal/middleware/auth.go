@@ -70,7 +70,7 @@ func IdentityMiddleware() gin.HandlerFunc {
 // PermissionResolver resolves a user's roles and flat permission set. Matches
 // services.GetUserPermissions's signature — injected rather than imported
 // directly so RequirePermission is unit-testable against a fake resolver
-// without a real MySQL connection.
+// rather than the real one.
 type PermissionResolver func(ctx context.Context, userID int64) (roles []string, perms map[string]bool, err error)
 
 // AuthMiddleware holds the permission resolver used to build RequirePermission

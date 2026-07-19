@@ -73,36 +73,12 @@ func main() {
 	anomalyConsumer := services.NewAnomalyConsumer(anomalyStore, anomalyWSMgr)
 	anomalyConsumer.Start()
 
-	// MySQL: verify the required schema already exists (RBAC tables + the
-	// five rule-definition storage tables). This backend
-	// never creates, alters, or seeds this schema — it's provisioned
-	// manually per environment (see internal/migrations/mysql/*.sql for the
-	// DDL to run by hand). Non-fatal by design, same as the ClickHouse/DuckDB
-	// init paths: RBAC-protected routes fail closed (503), and rule
-	// creation/edits fail closed (503) with a clear error, until the schema
-	// is confirmed present — but the rest of the backend keeps running.
-	func() {
-		verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := services.VerifyMySQLSchema(verifyCtx); err != nil {
-			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
-		}
-	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
-	// Create handlers
+	// Create handlers. rulesDB starts empty — this branch has no persistence
+	// layer behind it (see internal/handlers/rules.go), and demo is not
+	// expected to survive a process restart.
 	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
-
-	// Reload the rule list from MySQL — this is what lets the backend
-	// survive a restart with GET /rules still showing what was there before,
-	// instead of coming back empty (the previous CSV-based rule store never
-	// supported reading its own history back). Non-fatal: if MySQL is down,
-	// rulesDB just starts empty and self-heals as rules are recreated/edited.
-	func() {
-		loadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		rulesHandler.LoadFromMySQL(loadCtx)
-	}()
 
 	analysisHandler := handlers.NewAnalysisHandler(liveStore, anomalyStore)
 	wsHandler := handlers.NewWSHandler(liveStore, wsManager, anomalyStore, anomalyWSMgr)
@@ -234,9 +210,6 @@ func main() {
 
 	// Close ClickHouse
 	services.CloseClickHouse()
-
-	// Close MySQL
-	services.CloseMySQL()
 
 	slog.Info("Server exited gracefully")
 }

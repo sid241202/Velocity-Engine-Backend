@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -15,9 +14,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RulesHandler handles all rule CRUD operations. Rules are persisted to
-// MySQL (internal/services/rule_store.go) — see LoadFromMySQL for how this
-// handler's in-memory rulesDB is reconstructed at startup.
+// RulesHandler handles all rule CRUD operations. rulesDB is the sole store —
+// purely in-memory, guarded by mu. Demo is not expected to survive a process
+// restart (see this repo's CLAUDE.md); there is no persistence layer behind
+// this map.
 type RulesHandler struct {
 	mu        sync.RWMutex
 	rulesDB   map[string]*models.RuleRecord
@@ -25,33 +25,13 @@ type RulesHandler struct {
 	wsManager *services.WSManager
 }
 
-// NewRulesHandler creates a new RulesHandler. Call LoadFromMySQL once after
-// construction (and before the HTTP server starts accepting requests) to
-// populate rulesDB from persisted state.
+// NewRulesHandler creates a new RulesHandler with an empty rule set.
 func NewRulesHandler(ls *services.LiveStore, wm *services.WSManager) *RulesHandler {
 	return &RulesHandler{
 		rulesDB:   make(map[string]*models.RuleRecord),
 		liveStore: ls,
 		wsManager: wm,
 	}
-}
-
-// LoadFromMySQL repopulates the in-memory rule map from MySQL — this is what
-// makes the backend survive a restart without losing its rule list. Non-fatal:
-// if MySQL is unreachable, logs and leaves rulesDB empty rather than blocking
-// startup, matching the resilience philosophy used elsewhere in this backend
-// (most of it does not depend on MySQL) — GET /rules would simply show
-// nothing until this is resolved, rather than the process failing to start.
-func (h *RulesHandler) LoadFromMySQL(ctx context.Context) {
-	loaded, err := services.LoadActiveRules(ctx)
-	if err != nil {
-		slog.Error("Failed to load rules from MySQL at startup — starting with an empty rule set", "error", err)
-		return
-	}
-	h.mu.Lock()
-	h.rulesDB = loaded
-	h.mu.Unlock()
-	slog.Info("Rules reloaded from MySQL", "count", len(loaded))
 }
 
 // ReadRoot handles GET /
@@ -63,19 +43,11 @@ func (h *RulesHandler) ReadRoot(c *gin.Context) {
 }
 
 // Health handles GET /health (liveness probe — is the process alive?)
-// mysql is informational only — it does not affect the "healthy" status,
-// since most of this backend's functionality does not depend on MySQL/RBAC.
 func (h *RulesHandler) Health(c *gin.Context) {
-	mysqlOK, mysqlReason := services.IsMySQLReady()
-	mysqlStatus := "ok"
-	if !mysqlOK {
-		mysqlStatus = mysqlReason
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "healthy",
 		"live_store":     h.liveStore.Stats(),
 		"ws_connections": h.wsManager.ConnectionCount(),
-		"mysql":          mysqlStatus,
 	})
 }
 
@@ -146,15 +118,6 @@ func (h *RulesHandler) CreateRule(c *gin.Context) {
 	rulePayload, err := json.Marshal(rule)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to serialize rule"})
-		return
-	}
-
-	// Persist BEFORE committing to memory — MySQL is the actual durability
-	// guarantee now, not an afterthought, so a rule the caller is told
-	// succeeded must actually survive a restart.
-	if err := services.SaveNewRuleVersion(c.Request.Context(), &rule, 1); err != nil {
-		slog.Error("Failed to persist new rule", "rule_id", ruleID, "error", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "Failed to persist rule — please try again"})
 		return
 	}
 
@@ -261,16 +224,6 @@ func (h *RulesHandler) PublishRule(c *gin.Context) {
 		return
 	}
 
-	// Kafka already confirmed Flink will enforce this rule, so persistence
-	// failure here is logged loudly but does not fail the request — telling
-	// the caller "publish failed" would be misleading (it didn't). Worst
-	// case, a restart between now and the next successful write on this
-	// rule would reload it in its previous status; the log line is what
-	// makes that narrow window operationally visible.
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "ACTIVE", false); err != nil {
-		slog.Error("Rule published to Kafka but failed to persist status", "rule_id", ruleID, "error", err)
-	}
-
 	h.mu.Lock()
 	record.IsPublished = true
 	record.Status = "ACTIVE"
@@ -335,10 +288,6 @@ func (h *RulesHandler) UpdateRuleStatus(c *gin.Context) {
 		return
 	}
 
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, req.Status, false); err != nil {
-		slog.Error("Rule status published to Kafka but failed to persist", "rule_id", ruleID, "status", req.Status, "error", err)
-	}
-
 	h.mu.Lock()
 	record.Status = req.Status
 	record.RulePayload = newPayload
@@ -381,17 +330,6 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to publish DELETED tombstone to Kafka. Safety abort."})
 			return
 		}
-	}
-
-	// If it was ever published, the Kafka tombstone above already confirmed
-	// Flink stopped enforcing it, so it's safe to mark this deleted/inactive
-	// now. If it was never published, there was no live Flink state to begin
-	// with — this is just as safe. Either way, persistence failure here is
-	// logged loudly but doesn't block removal from memory: the row is
-	// harmless leftover state (still marked active) that self-corrects the
-	// next time this rule_id is reused, or can be cleaned up manually.
-	if err := services.UpdateRuleStatusInPlace(c.Request.Context(), ruleID, "DELETED", true); err != nil {
-		slog.Error("Rule deleted but failed to persist tombstone", "rule_id", ruleID, "error", err)
 	}
 
 	h.mu.Lock()
@@ -489,15 +427,6 @@ func (h *RulesHandler) UpdateRule(c *gin.Context) {
 	rulePayload, err := json.Marshal(rule)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to serialize rule"})
-		return
-	}
-
-	// Persist BEFORE committing to memory — same durability-first ordering
-	// as CreateRule; an edit that "succeeded" but isn't actually saved would
-	// silently revert on the next restart.
-	if err := services.SaveNewRuleVersion(c.Request.Context(), &rule, newVersion); err != nil {
-		slog.Error("Failed to persist rule update", "rule_id", ruleID, "version", newVersion, "error", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "Failed to persist rule update — please try again"})
 		return
 	}
 
