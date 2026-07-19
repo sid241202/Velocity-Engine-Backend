@@ -181,22 +181,23 @@ func main() {
 	router.POST("/rules/historical-breakdown", analysisHandler.HistoricalBreakdown)
 
 	// Rule CRUD
-	router.POST("/rules", rulesHandler.CreateRule)
+	router.POST("/rules", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "create"), rulesHandler.CreateRule)
 	router.GET("/rules", rulesHandler.ListRules)
 
 	// Parameterized routes AFTER static paths
 	router.GET("/rules/:rule_id", rulesHandler.GetRule)
-	// Publish and delete are gated behind RequirePermission as the first two
-	// routes wired to the new RBAC layer — the highest-stakes rule mutations
-	// (publish activates a rule against live auth traffic; delete is
-	// irreversible). The rest of the router is intentionally left unguarded
-	// for now: retrofitting every existing endpoint changes the auth
-	// requirements for the entire current API surface, which is a broader
-	// decision than "build the reusable middleware" — flagged for a
-	// follow-up pass once you've reviewed this on the rbac branch.
+	// Mutations are gated behind RequirePermission using the resource:action
+	// keys seeded in 0001_init_rbac.sql. UpdateRuleStatus is gated on
+	// "publish" (not a separate key) because setting status to ACTIVE calls
+	// the same services.PublishRule path as PublishRule itself — it's an
+	// alternate route to the identical production-activation effect, so it
+	// must require the identical permission, not a lesser one. Read-only
+	// routes (GET /rules, GET /rules/:rule_id, GET /rules/:rule_id/live-results)
+	// remain intentionally unguarded — that's a broader policy decision than
+	// this pass, left for a follow-up.
 	router.POST("/rules/:rule_id/prod", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.PublishRule)
-	router.POST("/rules/:rule_id/status", rulesHandler.UpdateRuleStatus)
-	router.PUT("/rules/:rule_id", rulesHandler.UpdateRule)
+	router.POST("/rules/:rule_id/status", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.UpdateRuleStatus)
+	router.PUT("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "update"), rulesHandler.UpdateRule)
 	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "delete"), rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 
