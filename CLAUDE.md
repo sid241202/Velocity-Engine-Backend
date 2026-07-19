@@ -22,10 +22,14 @@ to this repo.
 ## Config
 
 All configuration lives in `internal/config/config.go` — Kafka, ClickHouse,
-Iceberg/S3, LiveStore, MySQL, RBAC cache tuning, `AuthDevMode`. Don't add
-another config file — extend this one. `config.go`'s `init()` panics if
-`AuthDevMode` (or a missing S3 key) would be live with `ENV=prod` — that
-guard is intentional, don't relax it.
+Iceberg/S3, LiveStore, MySQL, RBAC cache tuning, WSO2/OIDC. Don't add
+another config file — extend this one. This branch (`release`) is
+**WSO2-only** — there is no `AuthDevMode`/dev-identity toggle in the code at
+all (removed as part of the WSO2 merge below). `config.go`'s `init()`
+panics if `WSO2_AUDIENCE` is unset, and separately if the S3 key pair would
+be live with `ENV=prod` — both guards are intentional, don't relax them.
+(`demo` is a different, deliberately-diverged branch — check its own
+`config.go`/`CLAUDE.md` directly rather than assuming it matches this.)
 
 ## RBAC (backend half)
 
@@ -38,26 +42,37 @@ guard is intentional, don't relax it.
 - `internal/services/rbac.go` — `GetUserPermissions` resolves + caches a
   user's roles/permissions (TTL cache with a stale-serving fail-tolerant
   window, then fail-closed). `internal/middleware/auth.go` —
-  `IdentityMiddleware` (temporary `X-Debug-User-Id` pre-WSO2 shim, disabled
-  outside `AuthDevMode`) and `RequirePermission(resource, action)`.
-  `internal/handlers/iam.go` — `GET /me`.
+  `IdentityMiddleware` validates the `Authorization: Bearer` token against
+  WSO2's JWKS (`internal/services/jwtvalidator.go`, real RS256 signature
+  verification) and resolves the token's `sub` claim to a local user via
+  `internal/services/rbac.go`'s `GetUserByExternalSubject` — no dev-mode
+  identity shim exists on this branch. `RequirePermission(resource, action)`
+  is the reusable per-route guard. `internal/handlers/iam.go` — `GET /me`.
 - Permission keys are `resource:action` strings (e.g. `rules:publish`) —
-  must match `frontend/src/permissions.js` exactly.
+  must match `frontend/src/permissions.js` exactly. Currently wired to
+  routes: `rules:create` (`POST /rules`), `rules:update`
+  (`PUT /rules/:rule_id`), `rules:publish` (`POST /rules/:rule_id/prod` and
+  `POST /rules/:rule_id/status` — status-change is gated on the same key as
+  publish because it can also set a rule to `ACTIVE` via the identical
+  `services.PublishRule` path), `rules:delete` (`DELETE /rules/:rule_id`).
+  The read-only routes (`GET /rules`, `GET /rules/:rule_id`, live-results)
+  remain intentionally unguarded — a separate, not-yet-made policy decision.
 
 ## Branches
 
-- `release` — stable/demo branch. As of 2026-07-16, has the full RBAC +
-  normalized-MySQL-rule-store surface merged in (`--no-ff` merge commit
-  `c2910c2`) — this is no longer separate feature work, it's what `release`
-  actually runs.
-- `rbac+persistentStore` — the branch this work was developed on (RBAC +
-  the MySQL rule store, cut from a now-deleted `rbac` branch). Already
-  merged into `release`; kept around rather than deleted.
-- The original `rbac` branch (RBAC-only, predating the MySQL rule store)
-  was superseded by `rbac+persistentStore` and deleted 2026-07-16, both
-  locally and on `github`, at the user's explicit request — its full
-  history is preserved via `rbac+persistentStore`'s ancestry, nothing was
-  lost.
+- `release` — stable/demo branch. Has the full RBAC + normalized-MySQL-
+  rule-store surface merged in (2026-07-16, `--no-ff` merge commit
+  `c2910c2`), *and* real WSO2/OIDC + JWKS token validation merged in
+  (2026-07-20, `wso2 integration in version 3.0.0`, commit `c8ea714`),
+  replacing the dev-only `X-Debug-User-Id` shim entirely — this branch has
+  no dev-mode auth fallback of any kind. Only `release` and `demo` exist as
+  branches in this repo now; every other branch used during this engagement
+  (`rbac+persistentStore`, the original `rbac`) has been merged and deleted.
+- `demo` — a separate, deliberately-diverged branch, **not** merged into
+  `release`. It still uses the pre-WSO2 `X-Debug-User-Id` shim for identity
+  (not WSO2), and its RBAC/rule-store storage layer differs from
+  `release`'s — verify demo's own `CLAUDE.md` and code directly rather than
+  assuming parity with this file.
 
 ## Local build/test — known toolchain limitation
 
@@ -101,3 +116,12 @@ this engagement):
    for DuckDB-linked binaries) is a system install at
    `C:\msys64\mingw64\bin\gcc.exe` — already on `PATH` normally, no action
    needed for that part.
+6. **Run `go vet`/`go build` for cgo-touching packages via the PowerShell
+   tool, not the Bash tool.** Confirmed 2026-07-20: invoking `gcc.exe` (and
+   therefore `cgo.exe`, which shells out to it) from this environment's Bash
+   tool silently fails — exit code 1/2, no stdout, no stderr, even for a
+   trivial one-line `.c` file compiled directly — regardless of
+   `dangerouslyDisableSandbox`. The identical command run via the
+   PowerShell tool works immediately. Pure-Go packages (no cgo) vet/build
+   fine from either tool; this only bites packages that actually invoke a C
+   compiler (i.e. anything pulling in `internal/services`/`cmd/server`).
