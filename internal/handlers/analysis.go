@@ -31,6 +31,22 @@ func respondHistoricalError(c *gin.Context, err error) {
 	c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
 }
 
+// respondClickHouseError maps a ClickHouse query error to the right HTTP
+// status: ErrClickHouseUnavailable means the connection itself is down (or
+// couldn't be dialed) — a transient, retryable condition (503), not a 500.
+// Everything else (a real query error) is an internal error. The real error
+// is logged by the caller; the client only ever sees a generic, safe
+// message, never a raw Go error string. Shared with internal/handlers/rules.go
+// (same package).
+func respondClickHouseError(c *gin.Context, err error) {
+	if errors.Is(err, services.ErrClickHouseUnavailable) {
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "The analytics store is temporarily unavailable. Please retry in a few seconds."})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal server error"})
+}
+
 // AnalysisHandler handles live-analysis, agg-analysis, historical-test, and historical-analysis endpoints.
 type AnalysisHandler struct {
 	liveStore    *services.LiveStore
@@ -145,8 +161,7 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	results, err := services.GetAggResults(c.Request.Context(), ids, startTS, endTS)
 	if err != nil {
 		slog.Error("Failed to get agg results", "error", err)
-		// Return user-friendly message — real error is already logged above
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to query aggregated analytics. Please try again or contact support."})
+		respondClickHouseError(c, err)
 		return
 	}
 

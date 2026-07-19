@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -19,6 +20,15 @@ import (
 // ClickHouse MUST be declared as DateTime('Asia/Kolkata') — Flink writes IST
 // wall-clock strings (e.g. "2026-07-06 14:30:00") with no timezone marker, so
 // only an explicit-IST column type interprets them correctly at insert time.
+
+// ErrClickHouseUnavailable wraps a connection-level failure (open/ping), as
+// opposed to a query/scan error against a live connection — callers use
+// errors.Is against this to return 503 (retryable) rather than 500, the
+// same distinction RunHistoricalAnalysis's ErrHistoricalEngineBusy makes for
+// DuckDB. Deliberately NOT used for the invalid-table-name config error
+// below: that's a permanent misconfiguration, not a transient outage, so it
+// stays a plain error (surfaces as 500).
+var ErrClickHouseUnavailable = errors.New("clickhouse is temporarily unavailable")
 
 var (
 	chDB    *sql.DB
@@ -61,8 +71,8 @@ func getClickHouseDB() (*sql.DB, error) {
 
 	if err := db.Ping(); err != nil {
 		slog.Error("Failed to ping ClickHouse — will retry on next request", "error", err)
-		chDBErr = err
-		return nil, err
+		chDBErr = fmt.Errorf("%w: %v", ErrClickHouseUnavailable, err)
+		return nil, chDBErr
 	}
 
 	chDB = db
