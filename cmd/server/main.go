@@ -153,14 +153,14 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	// Security Headers Middleware
-	router.Use(func(c *gin.Context) {
-		c.Header("X-Content-Type-Options", "nosniff")
-		c.Header("X-Frame-Options", "DENY")
-		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
-		c.Header("Content-Security-Policy", "default-src 'self'")
-		c.Next()
-	})
+	// Security headers (X-Content-Type-Options, X-Frame-Options,
+	// Referrer-Policy, Content-Security-Policy, Permissions-Policy) are set
+	// once, at the edge, by the frontend's nginx (see nginx.conf) for every
+	// path including the /api/ proxy_pass — this backend is never reached
+	// directly by a browser. Setting a second, weaker copy here caused every
+	// proxied response to carry duplicate headers (e.g. two
+	// Content-Security-Policy headers, which browsers merge into one comma-
+	// joined value) — a real finding from the 2026-07-23 WAS scan.
 
 	// Register routes — order matters for Gin!
 	// Root & health
