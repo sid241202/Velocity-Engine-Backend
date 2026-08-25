@@ -114,8 +114,9 @@ func IsMySQLReady() (bool, string) {
 // whoever operates MySQL there.
 var requiredTables = []string{
 	"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log",
-	"rules", "window_configs", "sink_configs", "aggregation_specs", "breach_conditions",
+	"rules", "sink_configs", "aggregation_specs", "breach_conditions",
 }
+//TODO: "window_configs" removed from above list as not in prod db
 
 // VerifyMySQLSchema checks that all required tables already exist in MySQL.
 // It is read-only: it never creates, alters, or seeds anything. Returns a
@@ -131,42 +132,36 @@ func VerifyMySQLSchema(ctx context.Context) error {
 		return fmt.Errorf("cannot verify MySQL schema — connection failed: %w", err)
 	}
 
-	placeholders := make([]string, len(requiredTables))
-	args := make([]interface{}, 0, len(requiredTables)+1)
-	args = append(args, config.MySQLDatabase)
-	for i, t := range requiredTables {
-		placeholders[i] = "?"
-		args = append(args, t)
-	}
-	query := fmt.Sprintf(
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN (%s)",
-		strings.Join(placeholders, ", "),
-	)
-
-	rows, err := db.QueryContext(ctx, query, args...)
+	// SHOW TABLES FROM `<db>` is simpler and avoids dynamic string/placeholder generation.
+	// We backtick the database name to handle any special characters safely.
+	query := fmt.Sprintf("SHOW TABLES FROM `%s`", config.MySQLDatabase)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to query information_schema for required tables: %w", err)
+		return fmt.Errorf("failed to execute SHOW TABLES: %w", err)
 	}
 	defer rows.Close()
 
-	found := make(map[string]bool, len(requiredTables))
+	// Read all existing tables into a map for O(1) lookups
+	found := make(map[string]bool)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("failed to scan information_schema row: %w", err)
+			return fmt.Errorf("failed to scan table name: %w", err)
 		}
 		found[name] = true
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating information_schema rows: %w", err)
+		return fmt.Errorf("error iterating table rows: %w", err)
 	}
 
+	// Check required tables against the found tables
 	var missing []string
 	for _, t := range requiredTables {
 		if !found[t] {
 			missing = append(missing, t)
 		}
 	}
+
 	if len(missing) > 0 {
 		return fmt.Errorf(
 			"MySQL database %q is missing required table(s) %v — run the relevant internal/migrations/mysql/*.sql file(s) manually against this database to provision them",

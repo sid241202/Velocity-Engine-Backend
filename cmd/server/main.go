@@ -83,7 +83,7 @@ func main() {
 	// creation/edits fail closed (503) with a clear error, until the schema
 	// is confirmed present — but the rest of the backend keeps running.
 	func() {
-		verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := services.VerifyMySQLSchema(verifyCtx); err != nil {
 			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
