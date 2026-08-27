@@ -45,7 +45,14 @@ func (as *AnomalyStore) GetRecent(ruleID string, n int) []map[string]interface{}
 	for i := len(as.events) - 1; i >= 0 && len(result) < n; i-- {
 		evt := as.events[i]
 		if ruleID != "" {
-			if id, _ := evt["id"].(string); id != ruleID {
+			// Filter on the normalized "ruleId" (processAnomaly guarantees it's
+			// always populated by the time an event reaches Add — copied from
+			// "id" if not already present), not the raw "id" field: an event
+			// whose source schema uses "ruleId" directly without an "id" field
+			// would otherwise never match here, even though the WebSocket
+			// broadcast path for the same event correctly resolves its rule ID
+			// via the same ruleId-then-id fallback.
+			if id, _ := evt["ruleId"].(string); id != ruleID {
 				continue
 			}
 		}

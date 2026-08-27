@@ -113,9 +113,8 @@ func IsMySQLReady() (bool, string) {
 // whoever operates MySQL there.
 var requiredTables = []string{
 	"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log",
-	"rules", "sink_configs", "aggregation_specs", "breach_conditions",
+	"rules", "window_configs", "sink_configs", "aggregation_specs", "breach_conditions",
 }
-//TODO: "window_configs" removed from above list as not in prod db
 
 // VerifyMySQLSchema checks that all required tables already exist in MySQL.
 // It is read-only: it never creates, alters, or seeds anything. Returns a

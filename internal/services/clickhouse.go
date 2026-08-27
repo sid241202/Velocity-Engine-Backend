@@ -183,9 +183,15 @@ func GetLiveResults(ctx context.Context, ruleID string, limit int) ([]map[string
 
 	rows, err := db.QueryContext(ctx, query, ruleID, limit)
 	if err != nil {
-		// If the connection died, reset so next caller gets a fresh one
+		// A query-time failure against a previously-healthy pooled connection
+		// is just as much "ClickHouse unavailable" as a failure at initial
+		// Ping — the common production case (ClickHouse goes down while the
+		// backend is already up and serving) hits this path, not the Ping
+		// path, since getClickHouseDB() only pings once per process to
+		// establish the pool. Reset so next caller gets a fresh connection
+		// (and a fresh Ping) rather than repeatedly retrying a dead one.
 		ResetClickHouseConn()
-		return nil, fmt.Errorf("clickhouse query failed: %w", err)
+		return nil, fmt.Errorf("%w: clickhouse query failed: %v", ErrClickHouseUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -228,7 +234,8 @@ func GetLiveResultsMulti(ruleIDs []string, hours int) (map[string][]map[string]i
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("clickhouse query failed: %w", err)
+		ResetClickHouseConn()
+		return nil, fmt.Errorf("%w: clickhouse query failed: %v", ErrClickHouseUnavailable, err)
 	}
 	defer queryRows.Close()
 
@@ -276,7 +283,8 @@ func GetAggResults(ctx context.Context, ruleIDs []string, startTS, endTS string)
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("clickhouse query failed: %w", err)
+		ResetClickHouseConn()
+		return nil, fmt.Errorf("%w: clickhouse query failed: %v", ErrClickHouseUnavailable, err)
 	}
 	defer rows.Close()
 
