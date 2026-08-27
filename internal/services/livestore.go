@@ -13,14 +13,16 @@ import (
 var istZoneLS = time.FixedZone("IST", 5*60*60+30*60)
 
 // parseWindowStart attempts to parse a windowStart value (string or int64) into time.Time.
-// Supports the IST-formatted string that ClickHouse returns and ISO-8601 that Flink may send.
+// Primary format is "2006-01-02 15:04:05" (IST, space-separated, no ms, no offset) — the
+// naive format Flink's TimeUtils.IST_FMT emits for every AggregationResult, and what
+// ClickHouse's bootstrap query also returns for the same underlying data. The ISO-8601
+// fallback below is kept for older/alternate producers, not the current Flink output.
 func parseWindowStart(v interface{}) (time.Time, bool) {
 	switch val := v.(type) {
 	case string:
 		if val == "" {
 			return time.Time{}, false
 		}
-		// Common format from ClickHouse bootstrap: "2006-01-02 15:04:05" (IST, no 'T', no 'Z')
 		if t, err := time.ParseInLocation("2006-01-02 15:04:05", val, istZoneLS); err == nil {
 			return t, true
 		}
