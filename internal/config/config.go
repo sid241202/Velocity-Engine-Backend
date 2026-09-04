@@ -69,14 +69,6 @@ var (
 	// authorization checks fail closed (503) instead of trusting old data forever.
 	RBACPermissionMaxStaleSeconds = getEnvInt("RBAC_PERMISSION_MAX_STALE_SECONDS", 1800)
 
-	// WSO2 / OIDC config. This branch is WSO2-only — there is no dev-mode
-	// identity shim and no config toggle back to one (see
-	// internal/middleware/auth.go). Defaults mirror the frontend's
-	// src/config/appConfig.js authConfig.metadata block (same WSO2 tenant).
-	WSO2JWKSURI         = getEnv("WSO2_JWKS_URI", "https://sso.uidai.net.in/oauth2/jwks")
-	WSO2Issuer          = getEnv("WSO2_ISSUER", "https://sso.uidai.net.in/oauth2")
-	WSO2Audience        = getEnv("WSO2_AUDIENCE", "") // no safe default — required, see init() below
-	JWTClockSkewSeconds = getEnvInt("JWT_CLOCK_SKEW_SECONDS", 60)
 )
 
 func init() {
@@ -86,13 +78,6 @@ func init() {
 		if os.Getenv("ENV") == "prod" {
 			panic("S3_ACCESS_KEY and S3_SECRET_KEY are required")
 		}
-	}
-	if WSO2Audience == "" {
-		// A missing audience would otherwise fail every single request at
-		// verification time instead of at boot — panic here mirrors the
-		// S3 check above. Unconditional: this branch has no other identity
-		// path to fall back to.
-		panic("WSO2_AUDIENCE is required")
 	}
 	if ResultsConsumerGroup == AnomalyConsumerGroup {
 		// Each consumer's actual group.id (see consumer.go/anomaly_consumer.go)

@@ -22,14 +22,19 @@ to this repo.
 ## Config
 
 All configuration lives in `internal/config/config.go` — Kafka, ClickHouse,
-Iceberg/S3, LiveStore, MySQL, RBAC cache tuning, WSO2/OIDC. Don't add
-another config file — extend this one. This branch (`release`) is
-**WSO2-only** — there is no `AuthDevMode`/dev-identity toggle in the code at
-all (removed as part of the WSO2 merge below). `config.go`'s `init()`
-panics if `WSO2_AUDIENCE` is unset, and separately if the S3 key pair would
-be live with `ENV=prod` — both guards are intentional, don't relax them.
+Iceberg/S3, LiveStore, MySQL, RBAC cache tuning. Don't add another config
+file — extend this one. This branch (`release`) is **WSO2-only** — there is
+no `AuthDevMode`/dev-identity toggle in the code at all (removed as part of
+the WSO2 merge below). `config.go`'s `init()` panics if the S3 key pair
+would be live with `ENV=prod` — that guard is intentional, don't relax it.
 (`demo` is a different, deliberately-diverged branch — check its own
 `config.go`/`CLAUDE.md` directly rather than assuming it matches this.)
+
+`WSO2_JWKS_URI`/`WSO2_ISSUER`/`WSO2_AUDIENCE`/`JWT_CLOCK_SKEW_SECONDS` and
+the `init()` panic on a missing `WSO2_AUDIENCE` were **removed 2026-09-04**
+— see the RBAC section below for why. Don't re-add them without also
+re-adding real JWKS verification; a `WSO2_AUDIENCE` env var with nothing
+reading it is worse than no env var at all.
 
 ## RBAC (backend half)
 
@@ -42,12 +47,28 @@ be live with `ENV=prod` — both guards are intentional, don't relax them.
 - `internal/services/rbac.go` — `GetUserPermissions` resolves + caches a
   user's roles/permissions (TTL cache with a stale-serving fail-tolerant
   window, then fail-closed). `internal/middleware/auth.go` —
-  `IdentityMiddleware` validates the `Authorization: Bearer` token against
-  WSO2's JWKS (`internal/services/jwtvalidator.go`, real RS256 signature
-  verification) and resolves the token's `sub` claim to a local user via
-  `internal/services/rbac.go`'s `GetUserByExternalSubject` — no dev-mode
-  identity shim exists on this branch. `RequirePermission(resource, action)`
-  is the reusable per-route guard. `internal/handlers/iam.go` — `GET /me`.
+  `IdentityMiddleware` trusts the `X-User-Subject` request header directly
+  as the caller's WSO2 `sub` claim (**not** cryptographically verified —
+  known, deliberate, temporary gap, see that function's doc comment) and
+  resolves it to a local user via `internal/services/rbac.go`'s
+  `GetUserByExternalSubject` — no dev-mode identity shim exists on this
+  branch, this is the only identity path. `RequirePermission(resource,
+  action)` is the reusable per-route guard. `internal/handlers/iam.go` —
+  `GET /me`.
+
+  This replaced real RS256 JWKS-based signature verification
+  (`internal/services/jwtvalidator.go`, deleted 2026-09-04, recoverable from
+  git history) because the backend pod could not reach
+  `https://sso.uidai.net.in/oauth2/jwks` from its network in the UIDAI prod
+  cluster (`strot-applications` namespace) — TLS handshake timeout, then EOF,
+  confirmed in prod logs; every request 401'd with "could not read JWK from
+  storage". Mirrors fraud-investigation-system's (Prahari) `X-User-Adid`
+  model — see that repo's `auth/README.md`, which hit and documented the
+  identical WSO2-JWKS-unreachable-from-backend-pod problem first. The
+  frontend sets `X-User-Subject` from the WSO2 `sub` claim it decodes
+  (unverified) from the id_token — see
+  `uid-dp-velocity-engine-control-plane-frontend/src/services/apiClient.js`.
+  Revisit once JWKS reachability from this namespace's pods is fixed.
 - Permission keys are `resource:action` strings (e.g. `rules:publish`) —
   must match `frontend/src/permissions.js` exactly. Currently wired to
   routes: `rules:create` (`POST /rules`), `rules:update`
@@ -68,6 +89,12 @@ be live with `ENV=prod` — both guards are intentional, don't relax them.
   no dev-mode auth fallback of any kind. Only `release` and `demo` exist as
   branches in this repo now; every other branch used during this engagement
   (`rbac+persistentStore`, the original `rbac`) has been merged and deleted.
+  **2026-09-04**: the JWKS-based verification from that merge was replaced
+  by the `X-User-Subject` trust model described in the RBAC section above —
+  prod's backend pods couldn't reach WSO2's JWKS endpoint at all, so the
+  2026-07-20 implementation never actually worked in this cluster. Identity
+  is still WSO2-derived end to end, just no longer cryptographically proven
+  backend-side.
 - `demo` — a separate, deliberately-diverged branch, **not** merged into
   `release`. It still uses the pre-WSO2 `X-Debug-User-Id` shim for identity
   (not WSO2), and its RBAC/rule-store storage layer differs from

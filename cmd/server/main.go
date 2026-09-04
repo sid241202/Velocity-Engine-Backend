@@ -91,13 +91,12 @@ func main() {
 	}()
 	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
-	// Wires IdentityMiddleware's real WSO2 dependencies (this branch is
-	// WSO2-only — see middleware.IdentityMiddleware's doc comment). The
-	// not-found translation here is the one place services.ErrUserNotFound
-	// and middleware.ErrIdentityNotFound meet — see both sentinels' doc
-	// comments for why internal/middleware doesn't import internal/services
-	// directly.
-	middleware.SetWSO2Dependencies(services.ValidateWSO2Token, func(ctx context.Context, sub string) (int64, string, error) {
+	// Wires IdentityMiddleware's real resolver dependency (see that
+	// function's doc comment for the current trust model). The not-found
+	// translation here is the one place services.ErrUserNotFound and
+	// middleware.ErrIdentityNotFound meet — see both sentinels' doc comments
+	// for why internal/middleware doesn't import internal/services directly.
+	middleware.SetIdentityResolver(func(ctx context.Context, sub string) (int64, string, error) {
 		userID, status, err := services.GetUserByExternalSubject(ctx, sub)
 		if errors.Is(err, services.ErrUserNotFound) {
 			return 0, "", middleware.ErrIdentityNotFound

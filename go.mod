@@ -6,12 +6,10 @@ toolchain go1.23.3
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.33.1
-	github.com/MicahParks/keyfunc/v3 v3.8.0
 	github.com/confluentinc/confluent-kafka-go/v2 v2.6.1
 	github.com/gin-contrib/cors v1.7.3
 	github.com/gin-gonic/gin v1.10.0
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/marcboeker/go-duckdb v1.8.3
 )
@@ -19,7 +17,6 @@ require (
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/ClickHouse/ch-go v0.65.1 // indirect
-	github.com/MicahParks/jwkset v0.11.0 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/apache/arrow-go/v18 v18.0.0 // indirect
 	github.com/bytedance/sonic v1.12.6 // indirect

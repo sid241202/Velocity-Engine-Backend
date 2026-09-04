@@ -14,13 +14,13 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// wso2DepsForTest wires fake WSO2TokenValidator/ExternalSubjectResolver
-// functions for the duration of a test and returns a func that clears them —
-// mirrors the real SetWSO2Dependencies call cmd/server makes at startup,
-// but with fakes so these tests need neither a real WSO2 tenant nor MySQL.
-func wso2DepsForTest(validator WSO2TokenValidator, resolver ExternalSubjectResolver) func() {
-	SetWSO2Dependencies(validator, resolver)
-	return func() { SetWSO2Dependencies(nil, nil) }
+// wso2DepsForTest wires a fake ExternalSubjectResolver for the duration of a
+// test and returns a func that clears it — mirrors the real
+// SetIdentityResolver call cmd/server makes at startup, but with a fake so
+// these tests need neither a real WSO2 tenant nor MySQL.
+func wso2DepsForTest(resolver ExternalSubjectResolver) func() {
+	SetIdentityResolver(resolver)
+	return func() { SetIdentityResolver(nil) }
 }
 
 func newTestRouter(resolver PermissionResolver, resource, action string, setUserID interface{}) *gin.Engine {
@@ -98,9 +98,8 @@ func TestRequirePermission_ServiceUnavailableOnResolverError(t *testing.T) {
 	}
 }
 
-func TestIdentityMiddleware_ValidTokenResolvesUser(t *testing.T) {
+func TestIdentityMiddleware_ValidSubjectHeaderResolvesUser(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, rawToken string) (string, error) { return "wso2-subject-42", nil },
 		func(ctx context.Context, sub string) (int64, string, error) { return 42, "ACTIVE", nil },
 	)()
 
@@ -111,7 +110,7 @@ func TestIdentityMiddleware_ValidTokenResolvesUser(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	req.Header.Set("X-User-Subject", "wso2-subject-42")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -120,14 +119,10 @@ func TestIdentityMiddleware_ValidTokenResolvesUser(t *testing.T) {
 	}
 }
 
-func TestIdentityMiddleware_MissingBearerHeaderRejected(t *testing.T) {
+func TestIdentityMiddleware_MissingSubjectHeaderRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, rawToken string) (string, error) {
-			t.Fatal("validator must not be called without a bearer header")
-			return "", nil
-		},
 		func(ctx context.Context, sub string) (int64, string, error) {
-			t.Fatal("resolver must not be called without a bearer header")
+			t.Fatal("resolver must not be called without a subject header")
 			return 0, "", nil
 		},
 	)()
@@ -136,30 +131,6 @@ func TestIdentityMiddleware_MissingBearerHeaderRejected(t *testing.T) {
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d (body: %s)", w.Code, w.Body.String())
-	}
-}
-
-func TestIdentityMiddleware_InvalidTokenRejected(t *testing.T) {
-	defer wso2DepsForTest(
-		func(ctx context.Context, rawToken string) (string, error) {
-			return "", errors.New("signature verification failed")
-		},
-		func(ctx context.Context, sub string) (int64, string, error) {
-			t.Fatal("resolver must not be called when token validation fails")
-			return 0, "", nil
-		},
-	)()
-
-	r := gin.New()
-	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
-
-	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("Authorization", "Bearer forged.token.here")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -170,7 +141,6 @@ func TestIdentityMiddleware_InvalidTokenRejected(t *testing.T) {
 
 func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, rawToken string) (string, error) { return "never-seen-before", nil },
 		func(ctx context.Context, sub string) (int64, string, error) { return 0, "", ErrIdentityNotFound },
 	)()
 
@@ -178,7 +148,7 @@ func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	req.Header.Set("X-User-Subject", "never-seen-before")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -189,7 +159,6 @@ func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
 
 func TestIdentityMiddleware_DisabledUserRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, rawToken string) (string, error) { return "wso2-subject-42", nil },
 		func(ctx context.Context, sub string) (int64, string, error) { return 42, "DISABLED", nil },
 	)()
 
@@ -197,7 +166,7 @@ func TestIdentityMiddleware_DisabledUserRejected(t *testing.T) {
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	req.Header.Set("X-User-Subject", "wso2-subject-42")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -207,13 +176,13 @@ func TestIdentityMiddleware_DisabledUserRejected(t *testing.T) {
 }
 
 func TestIdentityMiddleware_NotConfiguredWithoutDependencies(t *testing.T) {
-	defer wso2DepsForTest(nil, nil)()
+	defer wso2DepsForTest(nil)()
 
 	r := gin.New()
 	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
-	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	req.Header.Set("X-User-Subject", "wso2-subject-42")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

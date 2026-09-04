@@ -18,10 +18,6 @@ import (
 // resolved identity directly.
 const ContextKeyUserID = "auth_user_id"
 
-// WSO2TokenValidator validates a raw bearer token against WSO2's JWKS and
-// returns its "sub" claim. Matches services.ValidateWSO2Token's signature.
-type WSO2TokenValidator func(ctx context.Context, rawToken string) (sub string, err error)
-
 // ExternalSubjectResolver resolves a WSO2 "sub" claim to a local user ID and
 // status. Must return ErrIdentityNotFound (not services.ErrUserNotFound —
 // this package doesn't import internal/services) when the subject has no
@@ -33,65 +29,65 @@ type ExternalSubjectResolver func(ctx context.Context, sub string) (userID int64
 // "reject, not provisioned" (401) from a genuine resolver failure (503).
 var ErrIdentityNotFound = errors.New("identity not found")
 
-// wso2Validator/wso2Resolver back IdentityMiddleware. Set once at startup
-// via SetWSO2Dependencies — injected rather than imported directly
+// wso2Resolver backs IdentityMiddleware. Set once at startup via
+// SetIdentityResolver — injected rather than imported directly
 // (internal/services is not imported by this package at all) for the same
 // reason PermissionResolver below is injected: internal/services pulls in
 // go-duckdb (cgo) via duckdb.go, and this package needs to stay buildable/
 // vettable/testable without that dependency.
-var (
-	wso2Validator WSO2TokenValidator
-	wso2Resolver  ExternalSubjectResolver
-)
+var wso2Resolver ExternalSubjectResolver
 
-// SetWSO2Dependencies wires IdentityMiddleware's real dependencies. Call
-// once at startup (cmd/server, which already imports internal/services for
+// SetIdentityResolver wires IdentityMiddleware's real dependency. Call once
+// at startup (cmd/server, which already imports internal/services for
 // NewAuthMiddleware).
-func SetWSO2Dependencies(validator WSO2TokenValidator, resolver ExternalSubjectResolver) {
-	wso2Validator = validator
+func SetIdentityResolver(resolver ExternalSubjectResolver) {
 	wso2Resolver = resolver
 }
 
 // IdentityMiddleware resolves the current request's user ID and stores it
-// in the gin context under ContextKeyUserID. This branch is WSO2-only — no
-// dev-mode identity shim exists here and there is no config toggle back to
-// one; see uid-dp-velocity-engine-control-plane-frontend/CLAUDE.md and this
-// repo's own CLAUDE.md if a dev fallback is ever needed again, since the
-// `demo` branch (this branch's parent) still has one.
+// in the gin context under ContextKeyUserID.
 //
-// Validates the Authorization: Bearer token against WSO2's JWKS
-// (wso2Validator — real signature verification, not a decode-only check),
-// then resolves the token's "sub" claim to a local users.id via
-// wso2Resolver. An unrecognized subject is rejected (401), not
-// auto-provisioned — matching the deny-until-provisioned model confirmed in
-// the demo-wso2 plan's reference-backend research; admins still create
-// users/user_roles rows manually.
+// KNOWN, DELIBERATE, TEMPORARY SECURITY GAP: identity here is trusted from
+// the client-supplied X-User-Subject header, not cryptographically
+// verified. The header carries the WSO2 "sub" claim the frontend decoded
+// (unverified) from its id_token — see
+// uid-dp-velocity-engine-control-plane-frontend's src/services/apiClient.js.
+// There is currently no server-side proof this header wasn't forged; only
+// the RBAC permission check downstream (RequirePermission) is a real
+// access-control boundary.
+//
+// This mirrors fraud-investigation-system's (Prahari) documented approach —
+// see that repo's auth/README.md — adopted for the same reason Prahari
+// adopted it: this backend's previous implementation (real RS256 signature
+// verification against WSO2's JWKS, resolvable via git history) could not
+// reach https://sso.uidai.net.in/oauth2/jwks from this cluster's backend
+// pod network in prod (TLS handshake timeout, then EOF — a network-path
+// problem, not a code or credentials bug). Revisit once that reachability
+// is fixed; the JWKS-based version is recoverable from git history if
+// needed.
+//
+// Resolves the trusted "sub" to a local users.id via wso2Resolver. An
+// unrecognized subject is rejected (401), not auto-provisioned — matching
+// the deny-until-provisioned model confirmed in the demo-wso2 plan's
+// reference-backend research; admins still create users/user_roles rows
+// manually.
 func IdentityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if wso2Validator == nil || wso2Resolver == nil {
-			// Deployment wiring bug (SetWSO2Dependencies was never called),
+		if wso2Resolver == nil {
+			// Deployment wiring bug (SetIdentityResolver was never called),
 			// not a request error.
-			slog.Error("IdentityMiddleware used before SetWSO2Dependencies was called")
+			slog.Error("IdentityMiddleware used before SetIdentityResolver was called")
 			c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{
 				"detail": "Authentication is not yet configured on this deployment",
 			})
 			return
 		}
 
-		header := c.GetHeader("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(header, prefix) || len(header) <= len(prefix) {
+		sub := strings.TrimSpace(c.GetHeader("X-User-Subject"))
+		if sub == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"detail": "Missing or malformed Authorization: Bearer <token> header",
+				"detail": "Missing X-User-Subject header",
 			})
-			return
-		}
-		rawToken := strings.TrimPrefix(header, prefix)
-
-		sub, err := wso2Validator(c.Request.Context(), rawToken)
-		if err != nil {
-			slog.Warn("WSO2 token validation failed", "error", err)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "Invalid or expired token"})
 			return
 		}
 
