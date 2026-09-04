@@ -17,27 +17,47 @@ import (
 //   - WSManager (WebSocket push to subscribed clients)
 type ResultsConsumer struct {
 	cancel    context.CancelFunc
+	done      chan struct{}
 	liveStore *LiveStore
 	wsManager *WSManager
 }
 
 // NewResultsConsumer creates a new results consumer.
 func NewResultsConsumer(ls *LiveStore, wm *WSManager) *ResultsConsumer {
-	return &ResultsConsumer{liveStore: ls, wsManager: wm}
+	return &ResultsConsumer{liveStore: ls, wsManager: wm, done: make(chan struct{})}
 }
 
 // Start begins consuming in a background goroutine.
 func (rc *ResultsConsumer) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	rc.cancel = cancel
-	go rc.run(ctx)
+	go func() {
+		defer close(rc.done)
+		rc.run(ctx)
+	}()
 	slog.Info("Results consumer started", "topic", config.ResultsTopic)
 }
 
-// Stop signals the consumer goroutine to stop.
+// stopWait bounds how long Stop blocks for the consumer goroutine to
+// actually exit before giving up — a backstop so a stuck run() can't hang
+// process shutdown forever.
+const stopWait = 5 * time.Second
+
+// Stop signals the consumer goroutine to stop and waits (bounded by
+// stopWait) for it to actually call Close on its Kafka client. This matters
+// during graceful shutdown: a clean Close sends a LeaveGroupRequest so the
+// broker rebalances the group immediately, instead of only noticing this
+// member's absence after session.timeout.ms — the process exiting before
+// that Close happens would turn what should be a clean departure into an
+// unclean one.
 func (rc *ResultsConsumer) Stop() {
 	if rc.cancel != nil {
 		rc.cancel()
+	}
+	select {
+	case <-rc.done:
+	case <-time.After(stopWait):
+		slog.Warn("Results consumer did not stop within timeout during shutdown")
 	}
 	slog.Info("Results consumer stopped")
 }

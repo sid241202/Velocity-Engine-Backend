@@ -47,7 +47,14 @@ type wsEntry struct {
 	ruleIDs map[string]bool
 	outbox  chan []byte
 	closed  chan struct{}
-	once    sync.Once
+	// done is closed by writePump right before it returns (any exit path) —
+	// the signal a caller needs before it's safe to write to this
+	// connection itself. gorilla/websocket permits only one concurrent
+	// writer per connection; writePump is normally that writer, so anyone
+	// else touching the connection (see CloseAll) must wait for done first
+	// rather than assume closing `closed` was enough on its own.
+	done chan struct{}
+	once sync.Once
 }
 
 func newWsEntry(ruleIDs map[string]bool) *wsEntry {
@@ -55,6 +62,7 @@ func newWsEntry(ruleIDs map[string]bool) *wsEntry {
 		ruleIDs: ruleIDs,
 		outbox:  make(chan []byte, outboxSize),
 		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 }
 
@@ -89,6 +97,7 @@ func NewWSManager() *WSManager {
 // tears the connection down itself rather than waiting for the read
 // loop's own heartbeat timeout to notice.
 func (m *WSManager) writePump(conn *websocket.Conn, entry *wsEntry) {
+	defer close(entry.done)
 	for {
 		select {
 		case data := <-entry.outbox:
@@ -188,6 +197,48 @@ func (m *WSManager) Broadcast(ruleID string, row map[string]interface{}) {
 
 	for _, entry := range targets {
 		entry.enqueue(msg)
+	}
+}
+
+// closeAllWriterWait bounds how long CloseAll waits for a connection's
+// writePump to exit before giving up on sending that one connection a
+// close frame — a backstop, not an expected case.
+const closeAllWriterWait = 2 * time.Second
+
+// CloseAll sends every connected client a real WebSocket close frame, then
+// disconnects it. Used during process shutdown: net/http's Server.Shutdown
+// does not track or wait for hijacked connections — which is exactly what
+// every WebSocket connection is once upgraded (see gorilla/websocket's
+// Upgrader.Upgrade, which calls Hijack) — so without this, an active
+// connection would simply die when the process exits, with no close frame
+// ever reaching the client. CloseAll gives each client an explicit,
+// immediate signal to reconnect instead.
+//
+// This hands write ownership of each conn from its writePump goroutine to
+// this call: it signals the entry closed (stopping writePump from pulling
+// more off the outbox) and waits for entry.done before writing the close
+// frame itself, since gorilla/websocket permits only one concurrent writer
+// per connection and writePump is normally that writer.
+func (m *WSManager) CloseAll() {
+	m.mu.RLock()
+	entries := make(map[*websocket.Conn]*wsEntry, len(m.conns))
+	for conn, entry := range m.conns {
+		entries[conn] = entry
+	}
+	m.mu.RUnlock()
+
+	closeMsg := websocket.FormatCloseMessage(websocket.CloseServiceRestart, "server shutting down")
+	for conn, entry := range entries {
+		entry.stop()
+		select {
+		case <-entry.done:
+			conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+			conn.WriteMessage(websocket.CloseMessage, closeMsg)
+		case <-time.After(closeAllWriterWait):
+			slog.Warn("WebSocket writer did not stop in time — closing without a close frame")
+		}
+		m.Disconnect(conn)
+		conn.Close()
 	}
 }
 

@@ -94,6 +94,22 @@ func init() {
 		// path to fall back to.
 		panic("WSO2_AUDIENCE is required")
 	}
+	if ResultsConsumerGroup == AnomalyConsumerGroup {
+		// Each consumer's actual group.id (see consumer.go/anomaly_consumer.go)
+		// is this value plus "-<pod name>" — identical here means the results
+		// and anomaly consumers join Kafka as two members of the exact same
+		// consumer group despite subscribing to different topics. That's not
+		// a correctness issue for partition assignment (Kafka's classic
+		// assignors split each topic's partitions only among the members
+		// subscribed to it), but it couples their rebalance lifecycles:
+		// every join/leave/session-timeout in either consumer triggers a
+		// group-wide rebalance for both, so a transient hiccup in one topic's
+		// consumption can pause the other's too. RESULTS and ANOMALIES are
+		// independent data flows with no reason to share this. Panic here
+		// rather than let it silently cause intermittent, hard-to-diagnose
+		// consumption stalls.
+		panic("RESULTS_CONSUMER_GROUP and ANOMALY_CONSUMER_GROUP must be distinct")
+	}
 }
 
 func getEnv(key, fallback string) string {

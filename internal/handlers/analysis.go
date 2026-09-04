@@ -160,7 +160,7 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	slog.Info("AggAnalysis request", "rule_ids", ids, "start_ts", startTS, "end_ts", endTS)
 	results, err := services.GetAggResults(c.Request.Context(), ids, startTS, endTS)
 	if err != nil {
-		slog.Error("Failed to get agg results", "error", err)
+		slog.Error("Failed to get agg results", "rule_ids", ids, "start_ts", startTS, "end_ts", endTS, "error", err)
 		respondClickHouseError(c, err)
 		return
 	}
@@ -202,14 +202,16 @@ func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 		return
 	}
 
+	startStr := startDtNaive.Format("2006-01-02T15:04:05")
+	endStr := endDtNaive.Format("2006-01-02T15:04:05")
 	results, err := services.RunHistoricalAnalysis(
 		c.Request.Context(),
 		ruleDict,
-		startDtNaive.Format("2006-01-02T15:04:05"),
-		endDtNaive.Format("2006-01-02T15:04:05"),
+		startStr,
+		endStr,
 	)
 	if err != nil {
-		slog.Error("Historical test failed", "error", err)
+		slog.Error("Historical test failed", "rule_id", rule.RuleMetadata.RuleID, "days_back", daysBack, "start_ts", startStr, "end_ts", endStr, "error", err)
 		respondHistoricalError(c, err)
 		return
 	}
@@ -256,7 +258,7 @@ func (h *AnalysisHandler) HistoricalAnalysis(c *gin.Context) {
 
 	results, err := services.RunHistoricalAnalysis(c.Request.Context(), ruleDict, startTS, endTS)
 	if err != nil {
-		slog.Error("Historical analysis failed", "error", err)
+		slog.Error("Historical analysis failed", "rule_id", rule.RuleMetadata.RuleID, "start_ts", startTS, "end_ts", endTS, "error", err)
 		respondHistoricalError(c, err)
 		return
 	}
@@ -303,7 +305,7 @@ func (h *AnalysisHandler) HistoricalBreakdown(c *gin.Context) {
 
 	result, err := services.RunHistoricalBreakdown(c.Request.Context(), ruleDict, startTS, endTS)
 	if err != nil {
-		slog.Error("Historical breakdown failed", "error", err)
+		slog.Error("Historical breakdown failed", "rule_id", rule.RuleMetadata.RuleID, "start_ts", startTS, "end_ts", endTS, "error", err)
 		respondHistoricalError(c, err)
 		return
 	}

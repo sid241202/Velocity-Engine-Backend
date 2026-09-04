@@ -401,3 +401,114 @@ func TestWSManager_ConcurrentStress(t *testing.T) {
 		m.Disconnect(c)
 	}
 }
+
+// TestWSManager_CloseAllSendsCloseFrameAndDisconnects verifies the shutdown
+// path: every connected client receives a real WebSocket close frame (not
+// just a raw TCP drop) and is removed from the manager. This is what
+// cmd/server/main.go calls during SIGTERM handling, since srv.Shutdown
+// never sees these hijacked connections at all.
+func TestWSManager_CloseAllSendsCloseFrameAndDisconnects(t *testing.T) {
+	m := NewWSManager()
+	var serverConn *websocket.Conn
+	var wg sync.WaitGroup
+	wg.Add(1)
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		serverConn = conn
+		m.Connect(conn, []string{"R1"})
+		wg.Done()
+	})
+	client := dialTestWS(t, srv)
+	wg.Wait()
+
+	m.CloseAll()
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err := client.ReadMessage()
+	closeErr, ok := err.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("expected a *websocket.CloseError from CloseAll, got %v (%T)", err, err)
+	}
+	if closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("expected close code %d (CloseServiceRestart), got %d", websocket.CloseServiceRestart, closeErr.Code)
+	}
+
+	if m.ConnectionCount() != 0 {
+		t.Fatal("connection still registered in the manager after CloseAll")
+	}
+	_ = serverConn
+}
+
+// TestWSManager_CloseAllConcurrentWithBroadcast is the race-detector
+// assertion for CloseAll's writer handoff: while CloseAll is closing
+// connections, a concurrent Broadcast must never race with CloseAll's own
+// direct conn.WriteMessage call — CloseAll only takes over writing to a
+// connection after confirming (via entry.done) that connection's writePump
+// has actually exited, and Broadcast only ever enqueues onto a channel, so
+// this must be race-free. Run with `go test -race`.
+func TestWSManager_CloseAllConcurrentWithBroadcast(t *testing.T) {
+	m := NewWSManager()
+	const numConns = 4
+	var conns []*websocket.Conn
+	var connsMu sync.Mutex
+	var connWG sync.WaitGroup
+	connWG.Add(numConns)
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		m.Connect(conn, []string{"R1"})
+		connsMu.Lock()
+		conns = append(conns, conn)
+		connsMu.Unlock()
+		connWG.Done()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	var clients []*websocket.Conn
+	for i := 0; i < numConns; i++ {
+		clients = append(clients, dialTestWS(t, srv))
+	}
+	connWG.Wait()
+
+	var drainWG sync.WaitGroup
+	for _, c := range clients {
+		drainWG.Add(1)
+		go func(c *websocket.Conn) {
+			defer drainWG.Done()
+			for {
+				if _, _, err := c.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}(c)
+	}
+
+	var broadcastWG sync.WaitGroup
+	stop := make(chan struct{})
+	broadcastWG.Add(1)
+	go func() {
+		defer broadcastWG.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				m.Broadcast("R1", map[string]interface{}{"i": i})
+			}
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond) // let a few broadcasts land first
+	m.CloseAll()
+	close(stop)
+	broadcastWG.Wait()
+
+	for _, c := range clients {
+		c.Close()
+	}
+	drainWG.Wait()
+
+	if m.ConnectionCount() != 0 {
+		t.Fatal("connections still registered after CloseAll")
+	}
+}

@@ -245,6 +245,15 @@ func main() {
 		slog.Error("Server forced to shutdown", "error", err)
 	}
 
+	// srv.Shutdown does not track or wait for hijacked connections, which is
+	// exactly what every active WebSocket connection is (see
+	// internal/handlers/websocket.go's Upgrade call) — without this, an
+	// in-flight Live Stream/Anomaly panel connection would just die when
+	// this process exits below, with no close frame ever sent to the
+	// client. CloseAll sends each one a real close frame first.
+	wsManager.CloseAll()
+	anomalyWSMgr.CloseAll()
+
 	// Close Kafka producer
 	services.CloseProducer()
 

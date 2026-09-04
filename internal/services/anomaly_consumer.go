@@ -70,24 +70,37 @@ func (as *AnomalyStore) GetRecent(ruleID string, n int) []map[string]interface{}
 //   - AnomalyWSManager (WebSocket push to subscribed clients)
 type AnomalyConsumer struct {
 	cancel        context.CancelFunc
+	done          chan struct{}
 	anomalyStore  *AnomalyStore
 	anomalyWSMgr  *WSManager
 }
 
 func NewAnomalyConsumer(store *AnomalyStore, wm *WSManager) *AnomalyConsumer {
-	return &AnomalyConsumer{anomalyStore: store, anomalyWSMgr: wm}
+	return &AnomalyConsumer{anomalyStore: store, anomalyWSMgr: wm, done: make(chan struct{})}
 }
 
 func (ac *AnomalyConsumer) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	ac.cancel = cancel
-	go ac.run(ctx)
+	go func() {
+		defer close(ac.done)
+		ac.run(ctx)
+	}()
 	slog.Info("Anomaly consumer started", "topic", config.AnomalyTopic)
 }
 
+// Stop signals the consumer goroutine to stop and waits (bounded by
+// stopWait, defined in consumer.go) for it to actually close its Kafka
+// client — see ResultsConsumer.Stop's doc comment for why this matters for
+// a clean, immediate LeaveGroupRequest during shutdown.
 func (ac *AnomalyConsumer) Stop() {
 	if ac.cancel != nil {
 		ac.cancel()
+	}
+	select {
+	case <-ac.done:
+	case <-time.After(stopWait):
+		slog.Warn("Anomaly consumer did not stop within timeout during shutdown")
 	}
 	slog.Info("Anomaly consumer stopped")
 }
