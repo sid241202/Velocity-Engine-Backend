@@ -92,19 +92,22 @@ func IdentityMiddleware() gin.HandlerFunc {
 		}
 
 		userID, status, err := wso2Resolver(c.Request.Context(), sub)
-		if err != nil {
-			if errors.Is(err, ErrIdentityNotFound) {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"detail": "User not authorized: no local account for this identity",
-				})
-				return
-			}
-			slog.Error("Failed to resolve WSO2 subject to local user", "error", err)
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"detail": "Authorization service temporarily unavailable",
-			})
-			return
-		}
+        if err != nil {
+            if errors.Is(err, ErrIdentityNotFound) {
+                // ADD THIS LOG LINE:
+                slog.Warn("Identity rejected: external_subject not found in local users table", "received_sub", sub)
+
+                c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+                    "detail": "User not authorized: no local account for this identity",
+                })
+                return
+            }
+            slog.Error("Failed to resolve WSO2 subject to local user", "error", err)
+            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+                "detail": "Authorization service temporarily unavailable",
+            })
+            return
+        }
 		if status != "ACTIVE" {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"detail": "Account is disabled"})
 			return
