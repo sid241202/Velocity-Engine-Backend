@@ -266,6 +266,23 @@ func (s *LiveStore) trimExcess() {
 	}
 }
 
+// TotalRows returns the current row count across all rules — used by the
+// livestore_rows metric (see internal/metrics.RegisterLiveStoreCollectors).
+func (s *LiveStore) TotalRows() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalRows
+}
+
+// DroppedRowsTotal returns the cumulative count of rows evicted due to the
+// maxRows cap — used by the livestore_evictions_total metric (a
+// CounterFunc, since droppedRows only ever increases).
+func (s *LiveStore) DroppedRowsTotal() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return float64(s.droppedRows)
+}
+
 // StatsString returns a formatted stats string for logging.
 func (s *LiveStore) StatsString() string {
 	stats := s.Stats()

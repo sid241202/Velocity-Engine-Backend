@@ -49,7 +49,7 @@ func dialTestWS(t *testing.T, srv *httptest.Server) *websocket.Conn {
 // subscribed rule ID, and confirm the client actually receives a "delta"
 // message shaped the way LiveAnalysis.jsx/consumer.go expect.
 func TestWSManager_BroadcastDeliversToSubscriber(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -84,7 +84,7 @@ func TestWSManager_BroadcastDeliversToSubscriber(t *testing.T) {
 // TestWSManager_BroadcastDoesNotDeliverToUnsubscribed verifies a connection
 // subscribed to a different rule ID does not receive the broadcast.
 func TestWSManager_BroadcastDoesNotDeliverToUnsubscribed(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -112,7 +112,7 @@ func TestWSManager_BroadcastDoesNotDeliverToUnsubscribed(t *testing.T) {
 // though delivery itself is best-effort (see the "no loss" test below for
 // what is deliberately NOT guaranteed).
 func TestWSManager_MessageOrderingPreservedPerConnection(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -157,7 +157,7 @@ func TestWSManager_MessageOrderingPreservedPerConnection(t *testing.T) {
 // re-subscribing (a client sending a new {type:"subscribe"} with different
 // rule_ids on an existing socket) must update the existing entry in place.
 func TestWSManager_ConnectReusesEntryOnResubscribe(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -192,7 +192,7 @@ func TestWSManager_ConnectReusesEntryOnResubscribe(t *testing.T) {
 // read-loop's deferred Disconnect and the writer goroutine's self-triggered
 // Disconnect (on a write failure) can race to call this for the same conn.
 func TestWSManager_DisconnectIsIdempotent(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -255,7 +255,7 @@ func TestWSManager_EnqueueNeverBlocksAndDropsWhenFull(t *testing.T) {
 // and its writePump eventually blocks on the real network write (bounded by
 // writeDeadline) — Broadcast itself must still return immediately regardless.
 func TestWSManager_BroadcastNeverBlocksCallerOnSlowSubscriber(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var mu sync.Mutex
 	var slowConn, fastConn *websocket.Conn
 	var wg sync.WaitGroup
@@ -314,7 +314,7 @@ func TestWSManager_ConcurrentStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
 	}
-	m := NewWSManager()
+	m := NewWSManager("test")
 
 	const numConns = 4
 	const numWorkers = 4
@@ -408,7 +408,7 @@ func TestWSManager_ConcurrentStress(t *testing.T) {
 // cmd/server/main.go calls during SIGTERM handling, since srv.Shutdown
 // never sees these hijacked connections at all.
 func TestWSManager_CloseAllSendsCloseFrameAndDisconnects(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	var serverConn *websocket.Conn
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -446,7 +446,7 @@ func TestWSManager_CloseAllSendsCloseFrameAndDisconnects(t *testing.T) {
 // has actually exited, and Broadcast only ever enqueues onto a channel, so
 // this must be race-free. Run with `go test -race`.
 func TestWSManager_CloseAllConcurrentWithBroadcast(t *testing.T) {
-	m := NewWSManager()
+	m := NewWSManager("test")
 	const numConns = 4
 	var conns []*websocket.Conn
 	var connsMu sync.Mutex

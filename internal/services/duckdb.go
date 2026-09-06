@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	_ "github.com/marcboeker/go-duckdb"
 )
@@ -468,6 +469,17 @@ func ParseHavingExpression(expr string, validAliases map[string]bool) (string, e
 	return cleaned, nil
 }
 
+// duckdbErrorClass classifies a DuckDB/Iceberg error for the
+// duckdb_errors_total label: "busy" when the single query slot didn't free
+// up in time (matches ErrHistoricalEngineBusy — retryable), else
+// "query_error". Bounded to these two values.
+func duckdbErrorClass(err error) string {
+	if errors.Is(err, ErrHistoricalEngineBusy) {
+		return "busy"
+	}
+	return "query_error"
+}
+
 // ─── DuckDB engine ───────────────────────────────────────────────────────────
 // A single DuckDB *sql.Conn is pinned for the process lifetime and configured
 // exactly once (memory limit, temp dir, iceberg+httpfs extensions, S3 creds).
@@ -741,6 +753,16 @@ func prepareIcebergQuery(ctx context.Context, startTS, endTS string) (*icebergQu
 // frees the single query slot so subsequent requests are not starved. Returns
 // ErrHistoricalEngineBusy if the slot doesn't free up within the acquire window.
 func RunHistoricalAnalysis(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
+	start := time.Now()
+	results, err := runHistoricalAnalysisImpl(ctx, ruleDict, startTS, endTS)
+	metrics.DuckDBQueryDuration.WithLabelValues("historical_analysis").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.DuckDBErrorsTotal.WithLabelValues("historical_analysis", duckdbErrorClass(err)).Inc()
+	}
+	return results, err
+}
+
+func runHistoricalAnalysisImpl(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) ([]map[string]interface{}, error) {
 	q, err := prepareIcebergQuery(ctx, startTS, endTS)
 	if err != nil {
 		return nil, err
@@ -986,6 +1008,16 @@ var modalityBreakdownCols = []struct{ Label, Col string }{
 // and a silent ordering mistake there would produce wrong breakdown numbers
 // with no visible error — a correctness risk not worth the saved DuckDB scans.
 func RunHistoricalBreakdown(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) (map[string]interface{}, error) {
+	start := time.Now()
+	result, err := runHistoricalBreakdownImpl(ctx, ruleDict, startTS, endTS)
+	metrics.DuckDBQueryDuration.WithLabelValues("historical_breakdown").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.DuckDBErrorsTotal.WithLabelValues("historical_breakdown", duckdbErrorClass(err)).Inc()
+	}
+	return result, err
+}
+
+func runHistoricalBreakdownImpl(ctx context.Context, ruleDict map[string]interface{}, startTS, endTS string) (map[string]interface{}, error) {
 	q, err := prepareIcebergQuery(ctx, startTS, endTS)
 	if err != nil {
 		return nil, err

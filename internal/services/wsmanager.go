@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	"github.com/gorilla/websocket"
 )
@@ -33,6 +34,9 @@ var errOutboxFull = errors.New("websocket outbox full")
 type WSManager struct {
 	mu    sync.RWMutex
 	conns map[*websocket.Conn]*wsEntry
+	// name labels this manager's metrics ("live" or "anomaly" — see
+	// cmd/server/main.go's two NewWSManager calls). Fixed at 2 values.
+	name string
 }
 
 // wsEntry holds per-connection state: which rule IDs it's subscribed to,
@@ -84,10 +88,12 @@ func (e *wsEntry) stop() {
 	e.once.Do(func() { close(e.closed) })
 }
 
-// NewWSManager creates a new WebSocket manager.
-func NewWSManager() *WSManager {
+// NewWSManager creates a new WebSocket manager. name labels this manager's
+// metrics (e.g. "live" or "anomaly").
+func NewWSManager(name string) *WSManager {
 	return &WSManager{
 		conns: make(map[*websocket.Conn]*wsEntry),
+		name:  name,
 	}
 }
 
@@ -135,6 +141,7 @@ func (m *WSManager) Connect(conn *websocket.Conn, ruleIDs []string) {
 
 	if !exists {
 		go m.writePump(conn, entry)
+		metrics.WebSocketActiveConnections.WithLabelValues(m.name).Inc()
 	}
 	slog.Info("WebSocket connected", "subscribed_rules", len(ruleIDs))
 }
@@ -148,6 +155,7 @@ func (m *WSManager) Disconnect(conn *websocket.Conn) {
 	m.mu.Unlock()
 	if ok {
 		entry.stop()
+		metrics.WebSocketActiveConnections.WithLabelValues(m.name).Dec()
 	}
 	slog.Info("WebSocket disconnected")
 }
@@ -176,6 +184,11 @@ func (m *WSManager) WriteToConn(conn *websocket.Conn, msgType int, data []byte) 
 // client here must never be able to stall message consumption for every
 // other subscriber.
 func (m *WSManager) Broadcast(ruleID string, row map[string]interface{}) {
+	start := time.Now()
+	defer func() {
+		metrics.WebSocketBroadcastDuration.WithLabelValues(m.name).Observe(time.Since(start).Seconds())
+	}()
+
 	msg, err := json.Marshal(map[string]interface{}{
 		"type":    "delta",
 		"rule_id": ruleID,
@@ -196,7 +209,9 @@ func (m *WSManager) Broadcast(ruleID string, row map[string]interface{}) {
 	m.mu.RUnlock()
 
 	for _, entry := range targets {
-		entry.enqueue(msg)
+		if !entry.enqueue(msg) {
+			metrics.WebSocketDroppedTotal.WithLabelValues(m.name, "outbox_full").Inc()
+		}
 	}
 }
 

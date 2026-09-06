@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 )
@@ -171,6 +172,16 @@ func rowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
 
 // GetLiveResults fetches the latest rule results from ClickHouse for a single rule.
 func GetLiveResults(ctx context.Context, ruleID string, limit int) ([]map[string]interface{}, error) {
+	start := time.Now()
+	rows, err := getLiveResultsImpl(ctx, ruleID, limit)
+	metrics.ClickHouseQueryDuration.WithLabelValues("live_results").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.ClickHouseErrorsTotal.WithLabelValues("live_results", chErrorClass(err)).Inc()
+	}
+	return rows, err
+}
+
+func getLiveResultsImpl(ctx context.Context, ruleID string, limit int) ([]map[string]interface{}, error) {
 	db, err := getClickHouseDB()
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse not available: %w", err)
@@ -201,6 +212,16 @@ func GetLiveResults(ctx context.Context, ruleID string, limit int) ([]map[string
 // GetLiveResultsMulti returns results grouped by ruleId for the given rule IDs
 // within the last N hours. If ruleIDs is empty, queries ALL rules (for bootstrap).
 func GetLiveResultsMulti(ruleIDs []string, hours int) (map[string][]map[string]interface{}, error) {
+	start := time.Now()
+	grouped, err := getLiveResultsMultiImpl(ruleIDs, hours)
+	metrics.ClickHouseQueryDuration.WithLabelValues("live_results_multi").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.ClickHouseErrorsTotal.WithLabelValues("live_results_multi", chErrorClass(err)).Inc()
+	}
+	return grouped, err
+}
+
+func getLiveResultsMultiImpl(ruleIDs []string, hours int) (map[string][]map[string]interface{}, error) {
 	db, err := getClickHouseDB()
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse not available: %w", err)
@@ -259,6 +280,16 @@ func GetLiveResultsMulti(ruleIDs []string, hours int) (map[string][]map[string]i
 
 // GetAggResults queries ClickHouse for aggregated results within an explicit time range.
 func GetAggResults(ctx context.Context, ruleIDs []string, startTS, endTS string) (map[string][]map[string]interface{}, error) {
+	start := time.Now()
+	grouped, err := getAggResultsImpl(ctx, ruleIDs, startTS, endTS)
+	metrics.ClickHouseQueryDuration.WithLabelValues("agg_results").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.ClickHouseErrorsTotal.WithLabelValues("agg_results", chErrorClass(err)).Inc()
+	}
+	return grouped, err
+}
+
+func getAggResultsImpl(ctx context.Context, ruleIDs []string, startTS, endTS string) (map[string][]map[string]interface{}, error) {
 	if len(ruleIDs) == 0 {
 		return map[string][]map[string]interface{}{}, nil
 	}
@@ -332,6 +363,17 @@ func IsReady() (bool, string) {
 		return false, fmt.Sprintf("clickhouse ping failed: %s", err.Error())
 	}
 	return true, ""
+}
+
+// chErrorClass classifies a ClickHouse error for the clickhouse_errors_total
+// label: "unavailable" for a connection-level failure (retryable, matches
+// ErrClickHouseUnavailable), else "query_error". Bounded to these two
+// values — never the raw error string, which would be unbounded cardinality.
+func chErrorClass(err error) string {
+	if errors.Is(err, ErrClickHouseUnavailable) {
+		return "unavailable"
+	}
+	return "query_error"
 }
 
 // placeholders generates a comma-separated list of ? placeholders.

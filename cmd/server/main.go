@@ -14,11 +14,13 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/handlers"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 	"velocity-engine-control-plane-backend-go/internal/middleware"
 	"velocity-engine-control-plane-backend-go/internal/services"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -46,9 +48,12 @@ func main() {
 
 	// Initialize services
 	liveStore := services.NewLiveStore()
-	wsManager := services.NewWSManager()
+	wsManager := services.NewWSManager("live")
 	anomalyStore := services.NewAnomalyStore(10000)
-	anomalyWSMgr := services.NewWSManager()
+	anomalyWSMgr := services.NewWSManager("anomaly")
+
+	metrics.RegisterLiveStoreCollectors(liveStore.TotalRows, liveStore.DroppedRowsTotal)
+	metrics.RegisterMySQLPoolCollectors(services.MySQLPoolStats)
 
 	// Bootstrap LiveStore from ClickHouse
 	func() {
@@ -126,6 +131,7 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
+	router.Use(middleware.PrometheusMetrics())
 
 	// Request body size limit (1MB)
 	router.Use(func(c *gin.Context) {
@@ -166,6 +172,10 @@ func main() {
 	router.GET("/", rulesHandler.ReadRoot)
 	router.GET("/health", rulesHandler.Health)
 	router.GET("/readyz", rulesHandler.Readyz)
+	// Unauthenticated, same as /health and /readyz — Prometheus scrapes this
+	// via annotation-based discovery (no request-level auth, matching the
+	// platform's existing pattern), not through the frontend's WSO2 flow.
+	router.GET("/metrics", gin.WrapH(promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{})))
 
 	// Identity / authorization — frontend calls this once at bootstrap to
 	// hydrate its authorization context (which UI elements to show/hide).

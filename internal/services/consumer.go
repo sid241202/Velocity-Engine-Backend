@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -132,6 +133,20 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 				slog.Error("Results consumer read error — reconnecting", "error", err)
 				break // inner loop → reconnect outer loop
 			}
+
+			metrics.KafkaMessagesConsumedTotal.WithLabelValues(config.ResultsTopic).Inc()
+			// consumer_group label is the configured base group name, not
+			// the per-pod-suffixed groupID this consumer actually joined
+			// Kafka with — using the per-pod id would make this label's
+			// cardinality grow with every pod restart/rescale.
+			if _, high, wmErr := c.GetWatermarkOffsets(*msg.TopicPartition.Topic, msg.TopicPartition.Partition); wmErr == nil {
+				lag := high - int64(msg.TopicPartition.Offset) - 1
+				if lag < 0 {
+					lag = 0
+				}
+				metrics.KafkaConsumerLag.WithLabelValues(config.ResultsTopic, config.ResultsConsumerGroup).Set(float64(lag))
+			}
+
 			rc.processMessage(msg.Value)
 		}
 		c.Close()
@@ -144,6 +159,8 @@ func (rc *ResultsConsumer) processMessage(value []byte) {
 		slog.Error("Failed to unmarshal results message", "error", err)
 		return
 	}
+
+	metrics.ObserveConsumeDelay(config.ResultsTopic, row)
 
 	// ── Schema normalization ──────────────────────────────────────────────────
 	// New Flink schema: aggResult is a pre-serialized JSON string — parse it for richer display

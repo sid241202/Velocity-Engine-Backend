@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -175,6 +176,15 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 				break // inner loop → reconnect
 			}
 
+			metrics.KafkaMessagesConsumedTotal.WithLabelValues(config.AnomalyTopic).Inc()
+			if _, high, wmErr := c.GetWatermarkOffsets(*msg.TopicPartition.Topic, msg.TopicPartition.Partition); wmErr == nil {
+				lag := high - int64(msg.TopicPartition.Offset) - 1
+				if lag < 0 {
+					lag = 0
+				}
+				metrics.KafkaConsumerLag.WithLabelValues(config.AnomalyTopic, config.AnomalyConsumerGroup).Set(float64(lag))
+			}
+
 			ac.processAnomaly(msg.Value)
 		}
 		c.Close()
@@ -187,6 +197,8 @@ func (ac *AnomalyConsumer) processAnomaly(value []byte) {
 		slog.Error("Failed to unmarshal anomaly event", "error", err)
 		return
 	}
+
+	metrics.ObserveConsumeDelay(config.AnomalyTopic, evt)
 
 	// Add event_type discriminator so WS clients can distinguish from agg events
 	evt["event_type"] = "anomaly"

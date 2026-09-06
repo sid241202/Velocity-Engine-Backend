@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 )
 
 // ErrUserNotFound and ErrUserDisabled are authoritative negative results from
@@ -62,10 +63,14 @@ func GetUserPermissions(ctx context.Context, userID int64) ([]string, map[string
 
 	ttl := time.Duration(config.RBACPermissionCacheTTLSeconds) * time.Second
 	if ok && time.Since(entry.fetchedAt) < ttl {
+		metrics.RBACCacheHitsTotal.Inc()
 		return entry.roles, entry.perms, nil
 	}
+	metrics.RBACCacheMissesTotal.Inc()
 
+	fetchStart := time.Now()
 	roles, perms, err := fetchFunc(ctx, userID)
+	metrics.RBACResolutionDuration.Observe(time.Since(fetchStart).Seconds())
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) || errors.Is(err, ErrUserDisabled) {
 			permCacheMu.Lock()
@@ -168,6 +173,13 @@ func fetchUserPermissionsFromDB(ctx context.Context, userID int64) (roles []stri
 // backend's deny-until-provisioned behavior — an admin must have already
 // created this user via the existing manual MySQL provisioning process.
 func GetUserByExternalSubject(ctx context.Context, sub string) (userID int64, status string, err error) {
+	start := time.Now()
+	userID, status, err = getUserByExternalSubjectImpl(ctx, sub)
+	metrics.MySQLQueryDuration.WithLabelValues("get_user_by_external_subject").Observe(time.Since(start).Seconds())
+	return userID, status, err
+}
+
+func getUserByExternalSubjectImpl(ctx context.Context, sub string) (userID int64, status string, err error) {
 	db, err := getMySQLDB()
 	if err != nil {
 		return 0, "", fmt.Errorf("mysql unavailable: %w", err)
@@ -188,6 +200,13 @@ func GetUserByExternalSubject(ctx context.Context, sub string) (userID int64, st
 // this task — it's wired up ready for the future admin endpoints that grant/
 // revoke roles, which is where audit events actually originate.
 func RecordAuditEvent(ctx context.Context, actorUserID *int64, action, targetType, targetID string, metadata map[string]interface{}) error {
+	start := time.Now()
+	err := recordAuditEventImpl(ctx, actorUserID, action, targetType, targetID, metadata)
+	metrics.MySQLQueryDuration.WithLabelValues("record_audit_event").Observe(time.Since(start).Seconds())
+	return err
+}
+
+func recordAuditEventImpl(ctx context.Context, actorUserID *int64, action, targetType, targetID string, metadata map[string]interface{}) error {
 	db, err := getMySQLDB()
 	if err != nil {
 		return fmt.Errorf("mysql unavailable: %w", err)

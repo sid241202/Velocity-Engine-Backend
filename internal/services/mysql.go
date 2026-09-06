@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -104,6 +105,19 @@ func IsMySQLReady() (bool, string) {
 	return true, ""
 }
 
+// MySQLPoolStats returns a snapshot of the MySQL connection pool's stats for
+// the mysql_pool_* metrics (see internal/metrics.RegisterMySQLPoolCollectors).
+// Returns a zero-value sql.DBStats if the pool hasn't been initialized yet —
+// safe to register as a collector before the first MySQL call happens.
+func MySQLPoolStats() sql.DBStats {
+	mysqlDBMu.Lock()
+	defer mysqlDBMu.Unlock()
+	if mysqlDB == nil {
+		return sql.DBStats{}
+	}
+	return mysqlDB.Stats()
+}
+
 // requiredTables lists every table this backend expects to already exist in
 // MySQL: the RBAC tables (see internal/migrations/mysql/0001_init_rbac.sql)
 // plus the five rule-definition store tables (see
@@ -125,6 +139,13 @@ var requiredTables = []string{
 // missing table fail closed until the schema is confirmed present, but the
 // rest of the backend does not depend on MySQL.
 func VerifyMySQLSchema(ctx context.Context) error {
+	start := time.Now()
+	err := verifyMySQLSchemaImpl(ctx)
+	metrics.MySQLQueryDuration.WithLabelValues("verify_schema").Observe(time.Since(start).Seconds())
+	return err
+}
+
+func verifyMySQLSchemaImpl(ctx context.Context) error {
 	db, err := getMySQLDB()
 	if err != nil {
 		return fmt.Errorf("cannot verify MySQL schema — connection failed: %w", err)

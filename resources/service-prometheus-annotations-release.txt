@@ -1,0 +1,28 @@
+# uid-dp-velocity-engine-control-plane-backend @ release
+#
+# This repo does not own its own K8s manifests — they live in a separate
+# Gitea GitOps repo (see resources/configmap-release.txt for the same
+# convention: a tracked reference copy of externally-deployed config, not
+# something applied automatically from here). This file is the equivalent
+# reference for the Prometheus scrape wiring added in this change.
+#
+# Apply these three annotations to velocity-backend-svc's
+# metadata.annotations in that Gitea repo's service.yaml (see "Velocity
+# engine gitea files.txt" for the current manifest this patches):
+#
+#   metadata:
+#     annotations:
+#       prometheus.io/scrape: "true"
+#       prometheus.io/path: "/metrics"
+#       prometheus.io/port: "8000"
+#
+# Confirmed (2026-09-07): the same Prometheus that scrapes strot-flink via
+# this identical annotation pattern (see uid-dp-uc-request-tracker-raw-prom
+# in that namespace) already watches strot-applications too — no separate
+# Prometheus onboarding needed, just this annotation.
+#
+# No new container port or separate -prom Service is needed here, unlike
+# the Flink job's dedicated 9090/-prom Service: this backend serves
+# /metrics on the same port (8000) as the rest of the HTTP API, since it's
+# a single Gin server process, not a JVM job with its own metrics reporter
+# port.
