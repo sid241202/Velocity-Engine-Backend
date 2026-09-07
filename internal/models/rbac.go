@@ -51,5 +51,6 @@ type AuditLogEntry struct {
 type MeResponse struct {
 	UserID      int64    `json:"user_id"`
 	Roles       []string `json:"roles"`
-	Permissions []string `json:"permissions"` // flat "resource:action" strings
+	Permissions []string `json:"permissions"`  // flat "resource:action" strings
+	LedTeamIDs  []int64  `json:"led_team_ids"` // teams this user leads (team_leads rows) — see internal/services/admin.go
 }

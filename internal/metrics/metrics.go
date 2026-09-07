@@ -142,6 +142,50 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// IAMJITProvisionedUsersTotal / IAMJITProvisionRateLimitedTotal cover the
+	// two outcomes of GetOrProvisionUserByExternalSubject
+	// (internal/services/rbac.go) on an unrecognized WSO2 subject: a new
+	// user actually created, or the attempt rejected by the per-source-IP
+	// rate limit (config.JITProvisionRateLimitPerMinute) — the compensating
+	// control for auto-provisioning against an identity header that isn't
+	// cryptographically verified. Neither is visible via the generic
+	// http_requests_total, since both happen inside GET /me's identity
+	// resolution, not as their own route.
+	IAMJITProvisionedUsersTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "iam_jit_provisioned_users_total",
+		Help: "Total users auto-provisioned on first WSO2 login with no existing local account (JIT provisioning).",
+	})
+	IAMJITProvisionRateLimitedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "iam_jit_provision_rate_limited_total",
+		Help: "JIT-provisioning attempts rejected by the per-source-IP rate limit.",
+	})
+
+	// IAMAdminMutationsTotal covers every Admin Panel mutation by action and
+	// result. action is one of 4 fixed values (user_update — role/team/
+	// status changes, which of the three actually changed is captured
+	// precisely in the resulting audit_log row instead of here — team_create,
+	// lead_grant, lead_revoke); result is one of 3 (success, forbidden,
+	// error) — bounded cardinality, matches this project's existing
+	// label-design discipline. Distinct from the generic
+	// http_requests_total{route="/admin/users/:id",...}: that can't tell a
+	// successful update apart from a scope-forbidden one, both of which
+	// return non-5xx-shaped outcomes at the HTTP layer today (200 vs 403).
+	IAMAdminMutationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "iam_admin_mutations_total",
+		Help: "Admin Panel mutations, by action and result (success|forbidden|error).",
+	}, []string{"action", "result"})
+
+	// RBACCacheInvalidationsTotal counts explicit evictions triggered by an
+	// Admin Panel mutation (InvalidateUserPermissions) — the mechanism that
+	// makes a role/team/status change effective immediately instead of
+	// waiting out RBAC_PERMISSION_CACHE_TTL_SECONDS. Complements
+	// RBACCacheHitsTotal/MissesTotal: a healthy system should show this
+	// firing roughly once per real Admin Panel mutation, not continuously.
+	RBACCacheInvalidationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "rbac_permission_cache_invalidations_total",
+		Help: "Explicit RBAC permission cache invalidations triggered by an Admin Panel role/team/status change.",
+	})
+
 	// BackendConsumeDelay is the last checkpoint of the Kafka-to-Redis
 	// per-stage latency chain (see the observability plan): time from
 	// Flink's producedAt timestamp (TimeUtils.currentIstString() at
@@ -165,6 +209,8 @@ func init() {
 		DuckDBQueryDuration, DuckDBErrorsTotal,
 		MySQLQueryDuration,
 		RBACCacheHitsTotal, RBACCacheMissesTotal, RBACResolutionDuration,
+		IAMJITProvisionedUsersTotal, IAMJITProvisionRateLimitedTotal,
+		IAMAdminMutationsTotal, RBACCacheInvalidationsTotal,
 		BackendConsumeDelay,
 	)
 }

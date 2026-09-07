@@ -94,15 +94,20 @@ func main() {
 			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
 		}
 	}()
-	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
+	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions, services.GetLedTeamIDs)
 
 	// Wires IdentityMiddleware's real resolver dependency (see that
-	// function's doc comment for the current trust model). The not-found
-	// translation here is the one place services.ErrUserNotFound and
-	// middleware.ErrIdentityNotFound meet — see both sentinels' doc comments
-	// for why internal/middleware doesn't import internal/services directly.
-	middleware.SetIdentityResolver(func(ctx context.Context, sub string) (int64, string, error) {
-		userID, status, err := services.GetUserByExternalSubject(ctx, sub)
+	// function's doc comment for the current trust model). Uses
+	// GetOrProvisionUserByExternalSubject (JIT auto-provisioning), not
+	// GetUserByExternalSubject's deny-until-provisioned behavior — see the
+	// former's doc comment for the design tradeoff and compensating
+	// controls. ErrUserNotFound can still come back here (e.g. the JIT
+	// rate limit rejected this attempt) — that's the one place
+	// services.ErrUserNotFound and middleware.ErrIdentityNotFound meet; see
+	// both sentinels' doc comments for why internal/middleware doesn't
+	// import internal/services directly.
+	middleware.SetIdentityResolver(func(ctx context.Context, sub, sourceIP string) (int64, string, error) {
+		userID, status, err := services.GetOrProvisionUserByExternalSubject(ctx, sub, sourceIP)
 		if errors.Is(err, services.ErrUserNotFound) {
 			return 0, "", middleware.ErrIdentityNotFound
 		}
@@ -111,6 +116,7 @@ func main() {
 
 	// Create handlers
 	rulesHandler := handlers.NewRulesHandler(liveStore, wsManager)
+	adminHandler := handlers.NewAdminHandler()
 
 	// Reload the rule list from MySQL — this is what lets the backend
 	// survive a restart with GET /rules still showing what was there before,
@@ -180,6 +186,26 @@ func main() {
 	// Identity / authorization — frontend calls this once at bootstrap to
 	// hydrate its authorization context (which UI elements to show/hide).
 	router.GET("/me", middleware.IdentityMiddleware(), iamHandler.Me)
+
+	// Admin Panel — RequireAdminAccess (iam:manage OR any team leadership)
+	// gates entry to the group; the three SUPER_ADMIN-only actions (team
+	// creation, granting/revoking team leadership) additionally require
+	// iam:manage specifically, since a lead should never get to decide who
+	// else administers a team. Fine-grained per-target scoping for the
+	// GET/PATCH routes lives in internal/services/admin.go, not here — see
+	// RequireAdminAccess's own doc comment for why a static route gate can't
+	// express "your team only."
+	adminGroup := router.Group("/admin", middleware.IdentityMiddleware(), authMW.RequireAdminAccess())
+	{
+		adminGroup.GET("/users", adminHandler.ListUsers)
+		adminGroup.PATCH("/users/:id", adminHandler.UpdateUser)
+		adminGroup.GET("/teams", adminHandler.ListTeams)
+		adminGroup.GET("/roles", adminHandler.ListRoles)
+		adminGroup.GET("/audit-log", adminHandler.ListAuditLog)
+		adminGroup.POST("/teams", authMW.RequirePermission("iam", "manage"), adminHandler.CreateTeam)
+		adminGroup.POST("/teams/:id/leads", authMW.RequirePermission("iam", "manage"), adminHandler.GrantTeamLead)
+		adminGroup.DELETE("/teams/:id/leads/:userId", authMW.RequirePermission("iam", "manage"), adminHandler.RevokeTeamLead)
+	}
 
 	// Static paths BEFORE parameterized routes to avoid conflicts
 	router.GET("/rules/live-analysis", analysisHandler.LiveAnalysis)

@@ -41,6 +41,15 @@ func (h *IAMHandler) Me(c *gin.Context) {
 		return
 	}
 
+	// led_team_ids is deliberately not part of the cached permission set —
+	// see services.GetLedTeamIDs's doc comment on why it's a separate,
+	// uncached, indexed lookup rather than folded into GetUserPermissions.
+	ledTeamIDs, err := services.GetLedTeamIDs(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "Authorization service temporarily unavailable"})
+		return
+	}
+
 	permList := make([]string, 0, len(permSet))
 	for k := range permSet {
 		permList = append(permList, k)
@@ -50,5 +59,6 @@ func (h *IAMHandler) Me(c *gin.Context) {
 		UserID:      userID,
 		Roles:       roles,
 		Permissions: permList,
+		LedTeamIDs:  ledTeamIDs,
 	})
 }

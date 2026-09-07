@@ -25,13 +25,27 @@ func wso2DepsForTest(resolver ExternalSubjectResolver) func() {
 
 func newTestRouter(resolver PermissionResolver, resource, action string, setUserID interface{}) *gin.Engine {
 	r := gin.New()
-	authMW := NewAuthMiddleware(resolver)
+	authMW := NewAuthMiddleware(resolver, nil)
 	r.GET("/protected", func(c *gin.Context) {
 		if setUserID != nil {
 			c.Set(ContextKeyUserID, setUserID)
 		}
 		c.Next()
 	}, authMW.RequirePermission(resource, action), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	return r
+}
+
+func newAdminTestRouter(resolver PermissionResolver, ledTeamsResolver LedTeamsResolver, setUserID interface{}) *gin.Engine {
+	r := gin.New()
+	authMW := NewAuthMiddleware(resolver, ledTeamsResolver)
+	r.GET("/admin/protected", func(c *gin.Context) {
+		if setUserID != nil {
+			c.Set(ContextKeyUserID, setUserID)
+		}
+		c.Next()
+	}, authMW.RequireAdminAccess(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 	return r
@@ -100,7 +114,7 @@ func TestRequirePermission_ServiceUnavailableOnResolverError(t *testing.T) {
 
 func TestIdentityMiddleware_ValidSubjectHeaderResolvesUser(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, sub string) (int64, string, error) { return 42, "ACTIVE", nil },
+		func(ctx context.Context, sub, sourceIP string) (int64, string, error) { return 42, "ACTIVE", nil },
 	)()
 
 	r := gin.New()
@@ -121,7 +135,7 @@ func TestIdentityMiddleware_ValidSubjectHeaderResolvesUser(t *testing.T) {
 
 func TestIdentityMiddleware_MissingSubjectHeaderRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, sub string) (int64, string, error) {
+		func(ctx context.Context, sub, sourceIP string) (int64, string, error) {
 			t.Fatal("resolver must not be called without a subject header")
 			return 0, "", nil
 		},
@@ -141,7 +155,9 @@ func TestIdentityMiddleware_MissingSubjectHeaderRejected(t *testing.T) {
 
 func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, sub string) (int64, string, error) { return 0, "", ErrIdentityNotFound },
+		func(ctx context.Context, sub, sourceIP string) (int64, string, error) {
+			return 0, "", ErrIdentityNotFound
+		},
 	)()
 
 	r := gin.New()
@@ -159,7 +175,7 @@ func TestIdentityMiddleware_UnprovisionedSubjectRejected(t *testing.T) {
 
 func TestIdentityMiddleware_DisabledUserRejected(t *testing.T) {
 	defer wso2DepsForTest(
-		func(ctx context.Context, sub string) (int64, string, error) { return 42, "DISABLED", nil },
+		func(ctx context.Context, sub, sourceIP string) (int64, string, error) { return 42, "DISABLED", nil },
 	)()
 
 	r := gin.New()
@@ -188,5 +204,101 @@ func TestIdentityMiddleware_NotConfiguredWithoutDependencies(t *testing.T) {
 
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("expected 501, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestIdentityMiddleware_PassesSourceIPToResolver(t *testing.T) {
+	var gotIP string
+	defer wso2DepsForTest(
+		func(ctx context.Context, sub, sourceIP string) (int64, string, error) {
+			gotIP = sourceIP
+			return 42, "ACTIVE", nil
+		},
+	)()
+
+	r := gin.New()
+	r.GET("/whoami", IdentityMiddleware(), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/whoami", nil)
+	req.Header.Set("X-User-Subject", "wso2-subject-42")
+	req.RemoteAddr = "203.0.113.5:54321"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if gotIP != "203.0.113.5" {
+		t.Fatalf("expected resolver to receive the request's source IP, got %q", gotIP)
+	}
+}
+
+func TestRequireAdminAccess_AllowsIAMManage(t *testing.T) {
+	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
+		return []string{"SUPER_ADMIN"}, map[string]bool{"iam:manage": true}, nil
+	}
+	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
+		t.Fatal("led-teams resolver must not be consulted once iam:manage already grants access")
+		return nil, nil
+	}
+	r := newAdminTestRouter(resolver, ledTeams, int64(1))
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireAdminAccess_AllowsTeamLeadWithoutIAMManage(t *testing.T) {
+	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
+		return []string{"RULE_MANAGER"}, map[string]bool{"rules:publish": true}, nil
+	}
+	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
+		return []int64{2}, nil
+	}
+	r := newAdminTestRouter(resolver, ledTeams, int64(2))
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a team lead even without iam:manage, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireAdminAccess_DeniesNeitherIAMManageNorLead(t *testing.T) {
+	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
+		return []string{"READ_ONLY_ANALYST"}, map[string]bool{"rules:read": true}, nil
+	}
+	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
+		return []int64{}, nil
+	}
+	r := newAdminTestRouter(resolver, ledTeams, int64(5))
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireAdminAccess_ServiceUnavailableOnLedTeamsResolverError(t *testing.T) {
+	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
+		return []string{"READ_ONLY_ANALYST"}, map[string]bool{"rules:read": true}, nil
+	}
+	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
+		return nil, errors.New("mysql unavailable")
+	}
+	r := newAdminTestRouter(resolver, ledTeams, int64(5))
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d (body: %s)", w.Code, w.Body.String())
 	}
 }

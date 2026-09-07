@@ -18,11 +18,14 @@ import (
 // resolved identity directly.
 const ContextKeyUserID = "auth_user_id"
 
-// ExternalSubjectResolver resolves a WSO2 "sub" claim to a local user ID and
+// ExternalSubjectResolver resolves a WSO2 "sub" claim (plus the request's
+// source IP, passed through for JIT-provisioning rate limiting — see
+// services.GetOrProvisionUserByExternalSubject) to a local user ID and
 // status. Must return ErrIdentityNotFound (not services.ErrUserNotFound —
 // this package doesn't import internal/services) when the subject has no
-// matching local user; the wiring in cmd/server translates between the two.
-type ExternalSubjectResolver func(ctx context.Context, sub string) (userID int64, status string, err error)
+// matching local user and the resolver isn't auto-provisioning one; the
+// wiring in cmd/server translates between the two.
+type ExternalSubjectResolver func(ctx context.Context, sub string, sourceIP string) (userID int64, status string, err error)
 
 // ErrIdentityNotFound is the sentinel an ExternalSubjectResolver must return
 // when a WSO2 subject has no matching local user — distinguishes
@@ -66,11 +69,13 @@ func SetIdentityResolver(resolver ExternalSubjectResolver) {
 // is fixed; the JWKS-based version is recoverable from git history if
 // needed.
 //
-// Resolves the trusted "sub" to a local users.id via wso2Resolver. An
-// unrecognized subject is rejected (401), not auto-provisioned — matching
-// the deny-until-provisioned model confirmed in the demo-wso2 plan's
-// reference-backend research; admins still create users/user_roles rows
-// manually.
+// Resolves the trusted "sub" to a local users.id via wso2Resolver. Whether
+// an unrecognized subject is rejected or auto-provisioned depends entirely
+// on which resolver cmd/server wired in — this middleware doesn't know or
+// care which; see services.GetOrProvisionUserByExternalSubject for the
+// JIT-provisioning behavior actually wired in today, and its own doc comment
+// for the compensating controls that make auto-provisioning against this
+// unverified header defensible.
 func IdentityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if wso2Resolver == nil {
@@ -91,23 +96,21 @@ func IdentityMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		userID, status, err := wso2Resolver(c.Request.Context(), sub)
-        if err != nil {
-            if errors.Is(err, ErrIdentityNotFound) {
-                // ADD THIS LOG LINE:
-                slog.Warn("Identity rejected: external_subject not found in local users table", "received_sub", sub)
-
-                c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-                    "detail": "User not authorized: no local account for this identity",
-                })
-                return
-            }
-            slog.Error("Failed to resolve WSO2 subject to local user", "error", err)
-            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-                "detail": "Authorization service temporarily unavailable",
-            })
-            return
-        }
+		userID, status, err := wso2Resolver(c.Request.Context(), sub, c.ClientIP())
+		if err != nil {
+			if errors.Is(err, ErrIdentityNotFound) {
+				slog.Warn("Identity rejected: external_subject not found in local users table", "received_sub", sub)
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"detail": "User not authorized: no local account for this identity",
+				})
+				return
+			}
+			slog.Error("Failed to resolve WSO2 subject to local user", "error", err)
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"detail": "Authorization service temporarily unavailable",
+			})
+			return
+		}
 		if status != "ACTIVE" {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"detail": "Account is disabled"})
 			return
@@ -124,15 +127,24 @@ func IdentityMiddleware() gin.HandlerFunc {
 // without a real MySQL connection.
 type PermissionResolver func(ctx context.Context, userID int64) (roles []string, perms map[string]bool, err error)
 
-// AuthMiddleware holds the permission resolver used to build RequirePermission
-// guards. Construct once at startup with services.GetUserPermissions.
+// LedTeamsResolver resolves which team IDs a user leads. Matches
+// services.GetLedTeamIDs's signature — injected for the same reason
+// PermissionResolver is (keeps this package free of internal/services'
+// go-duckdb/cgo dependency). Used by RequireAdminAccess to decide whether a
+// non-iam:manage user still belongs in the Admin Panel as a team lead.
+type LedTeamsResolver func(ctx context.Context, userID int64) ([]int64, error)
+
+// AuthMiddleware holds the resolvers used to build RequirePermission/
+// RequireAdminAccess guards. Construct once at startup with
+// services.GetUserPermissions and services.GetLedTeamIDs.
 type AuthMiddleware struct {
-	Resolver PermissionResolver
+	Resolver         PermissionResolver
+	LedTeamsResolver LedTeamsResolver
 }
 
-// NewAuthMiddleware constructs an AuthMiddleware bound to the given resolver.
-func NewAuthMiddleware(resolver PermissionResolver) *AuthMiddleware {
-	return &AuthMiddleware{Resolver: resolver}
+// NewAuthMiddleware constructs an AuthMiddleware bound to the given resolvers.
+func NewAuthMiddleware(resolver PermissionResolver, ledTeamsResolver LedTeamsResolver) *AuthMiddleware {
+	return &AuthMiddleware{Resolver: resolver, LedTeamsResolver: ledTeamsResolver}
 }
 
 // RequirePermission returns middleware that aborts with 403 unless the
@@ -169,6 +181,59 @@ func (m *AuthMiddleware) RequirePermission(resource, action string) gin.HandlerF
 		if !perms[required] {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 				"detail": "Insufficient permissions: requires " + required,
+			})
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// RequireAdminAccess gates the /admin/* route group: full access via
+// iam:manage (SUPER_ADMIN today), or scoped access via leading at least one
+// team. This only answers "does this user belong in the Admin Panel at
+// all" — the fine-grained scoping (which users/teams/audit entries a
+// non-iam:manage actor can actually see or mutate) happens in
+// internal/services/admin.go and internal/handlers/admin.go, since it's
+// data-dependent (which team) in a way a static per-route guard can't express.
+func (m *AuthMiddleware) RequireAdminAccess() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		uidRaw, exists := c.Get(ContextKeyUserID)
+		if !exists {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "Authentication required"})
+			return
+		}
+		userID, ok := uidRaw.(int64)
+		if !ok {
+			slog.Error("auth_user_id in context has unexpected type", "value", uidRaw)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"detail": "Internal authorization error"})
+			return
+		}
+
+		_, perms, err := m.Resolver(c.Request.Context(), userID)
+		if err != nil {
+			slog.Error("Permission resolution failed", "user_id", userID, "error", err)
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"detail": "Authorization service temporarily unavailable",
+			})
+			return
+		}
+		if perms["iam:manage"] {
+			c.Next()
+			return
+		}
+
+		led, err := m.LedTeamsResolver(c.Request.Context(), userID)
+		if err != nil {
+			slog.Error("Team-lead resolution failed", "user_id", userID, "error", err)
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"detail": "Authorization service temporarily unavailable",
+			})
+			return
+		}
+		if len(led) == 0 {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"detail": "Insufficient permissions: requires iam:manage or team leadership",
 			})
 			return
 		}

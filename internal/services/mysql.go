@@ -119,15 +119,21 @@ func MySQLPoolStats() sql.DBStats {
 }
 
 // requiredTables lists every table this backend expects to already exist in
-// MySQL: the RBAC tables (see internal/migrations/mysql/0001_init_rbac.sql)
-// plus the five rule-definition store tables (see
+// MySQL: the RBAC tables (see internal/migrations/mysql/0001_init_rbac.sql),
+// the five rule-definition store tables (see
 // internal/migrations/mysql/0002_init_rules_store.sql and
-// internal/services/rule_store.go). This backend never creates, alters, or
-// seeds any of this schema — it's provisioned manually, per environment, by
-// whoever operates MySQL there.
+// internal/services/rule_store.go), and the multi-team RBAC extension (see
+// internal/migrations/mysql/0003_add_teams.sql). This backend never creates,
+// alters, or seeds any of this schema — it's provisioned manually, per
+// environment, by whoever operates MySQL there.
+//
+// This only checks table existence (SHOW TABLES), not column-level shape —
+// same granularity as before 0003_add_teams.sql, which also adds a
+// users.team_id column this check does not separately verify.
 var requiredTables = []string{
 	"users", "roles", "permissions", "user_roles", "role_permissions", "audit_log",
 	"rules", "window_configs", "sink_configs", "aggregation_specs", "breach_conditions",
+	"teams", "team_leads",
 }
 
 // VerifyMySQLSchema checks that all required tables already exist in MySQL.

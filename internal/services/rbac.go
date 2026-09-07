@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/metrics"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // ErrUserNotFound and ErrUserDisabled are authoritative negative results from
@@ -95,13 +99,17 @@ func GetUserPermissions(ctx context.Context, userID int64) ([]string, map[string
 }
 
 // InvalidateUserPermissions evicts a user's cached permission set, forcing the
-// next GetUserPermissions call to re-resolve from MySQL. Call this whenever a
-// user's role assignments change (future admin endpoints) so the effect is
-// immediate rather than waiting out the TTL.
+// next GetUserPermissions call to re-resolve from MySQL. Called from every
+// Admin Panel mutation that changes a user's role/team/status (see
+// internal/services/admin.go) so the effect is immediate rather than waiting
+// out the TTL — the active-invalidation half of the agreed cache strategy,
+// with the TTL/stale-serving behavior kept as-is for the now-rarer case of a
+// direct external DB edit.
 func InvalidateUserPermissions(userID int64) {
 	permCacheMu.Lock()
 	delete(permCache, userID)
 	permCacheMu.Unlock()
+	metrics.RBACCacheInvalidationsTotal.Inc()
 }
 
 // fetchUserPermissionsFromDB resolves a user's roles and flat permission set
@@ -165,13 +173,15 @@ func fetchUserPermissionsFromDB(ctx context.Context, userID int64) (roles []stri
 
 // GetUserByExternalSubject resolves a WSO2/OIDC "sub" claim to this system's
 // local users.id + status, via the external_subject column that schema was
-// designed for (see 0001_init_rbac.sql). Used by IdentityMiddleware — this
-// branch's only identity path.
+// designed for (see 0001_init_rbac.sql).
 //
 // Deliberately does NOT auto-create a user row on a miss: ErrUserNotFound
 // here means "reject the request," matching the reference operator360
-// backend's deny-until-provisioned behavior — an admin must have already
-// created this user via the existing manual MySQL provisioning process.
+// backend's original deny-until-provisioned behavior. IdentityMiddleware is
+// now wired to GetOrProvisionUserByExternalSubject instead (see
+// cmd/server/main.go), which auto-provisions on a miss — this function
+// remains available (and still fully tested) for any future caller that must
+// NOT auto-provision.
 func GetUserByExternalSubject(ctx context.Context, sub string) (userID int64, status string, err error) {
 	start := time.Now()
 	userID, status, err = getUserByExternalSubjectImpl(ctx, sub)
@@ -193,6 +203,175 @@ func getUserByExternalSubjectImpl(ctx context.Context, sub string) (userID int64
 		return 0, "", fmt.Errorf("failed to look up user by external_subject: %w", err)
 	}
 	return userID, status, nil
+}
+
+// jitRateLimiter is a simple fixed-window counter per source IP, guarding
+// GetOrProvisionUserByExternalSubject. This is the compensating control for
+// JIT auto-provisioning's real exposure: IdentityMiddleware trusts the
+// client-supplied X-User-Subject header without cryptographic verification
+// (see that function's doc comment), so without a bound, auto-creating a
+// user for every unrecognized subject would let anyone who can reach this
+// backend mint unlimited accounts just by varying the header value. A fixed
+// window (not a sliding one or a token bucket) is deliberately simple here —
+// this only needs to catch a sustained flood, not shape traffic precisely.
+var (
+	jitRateMu          sync.Mutex
+	jitRateWindowStart time.Time
+	jitRateCounts      = make(map[string]int)
+)
+
+const jitRateWindow = time.Minute
+
+func jitRateLimited(sourceIP string) bool {
+	jitRateMu.Lock()
+	defer jitRateMu.Unlock()
+
+	now := time.Now()
+	if now.Sub(jitRateWindowStart) > jitRateWindow {
+		jitRateWindowStart = now
+		jitRateCounts = make(map[string]int)
+	}
+	jitRateCounts[sourceIP]++
+	return jitRateCounts[sourceIP] > config.JITProvisionRateLimitPerMinute
+}
+
+// GetOrProvisionUserByExternalSubject resolves a WSO2/OIDC "sub" claim to a
+// local user, auto-creating one (READ_ONLY_ANALYST, the MISC default team)
+// on first sight instead of GetUserByExternalSubject's deny-until-provisioned
+// behavior. This is a deliberate reversal of a previously-deliberate security
+// posture — see the design discussion for the full tradeoff — made more
+// defensible by three compensating controls: a per-source-IP rate limit
+// (jitRateLimited, above), an audit_log row for every provisioning event, and
+// the IAMJITProvisionedUsersTotal/IAMJITProvisionRateLimitedTotal metrics so
+// an unusual burst of new-user creation is visible in the same dashboard as
+// everything else, not something someone has to notice by reading a table.
+//
+// Wired in as IdentityMiddleware's resolver (see cmd/server/main.go) in place
+// of GetUserByExternalSubject — that function still exists and is still the
+// right choice for anything that must NOT auto-provision.
+func GetOrProvisionUserByExternalSubject(ctx context.Context, sub, sourceIP string) (userID int64, status string, err error) {
+	userID, status, err = getUserByExternalSubjectImpl(ctx, sub)
+	if err == nil {
+		return userID, status, nil
+	}
+	if !errors.Is(err, ErrUserNotFound) {
+		return 0, "", err
+	}
+
+	if jitRateLimited(sourceIP) {
+		metrics.IAMJITProvisionRateLimitedTotal.Inc()
+		slog.Warn("JIT provisioning rate-limited", "source_ip", sourceIP)
+		return 0, "", ErrUserNotFound
+	}
+
+	userID, status, err = provisionUserByExternalSubject(ctx, sub)
+	if err != nil {
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			// Lost a race with a concurrent request provisioning the same
+			// subject — the other insert already landed, so look it up.
+			return getUserByExternalSubjectImpl(ctx, sub)
+		}
+		return 0, "", err
+	}
+
+	metrics.IAMJITProvisionedUsersTotal.Inc()
+	if auditErr := RecordAuditEvent(ctx, nil, "user.jit_provision", "user", strconv.FormatInt(userID, 10), map[string]interface{}{
+		"external_subject": sub,
+		"source_ip":        sourceIP,
+	}); auditErr != nil {
+		slog.Error("Failed to record JIT-provisioning audit event", "user_id", userID, "error", auditErr)
+	}
+	return userID, status, nil
+}
+
+// provisionUserByExternalSubject creates a new user row, assigns it to the
+// MISC default team, and grants READ_ONLY_ANALYST — all in one transaction
+// so a partial provision (a user row with no role, or no team) can never
+// happen. There's no email/display name available at this layer (the
+// frontend only ever sends the WSO2 "sub" via X-User-Subject, not profile
+// claims — see apiClient.js's getAuthHeaders), so both are placeholder-
+// derived from sub itself; a super admin or team lead can rename the user
+// once they know who it actually is.
+func provisionUserByExternalSubject(ctx context.Context, sub string) (userID int64, status string, err error) {
+	db, err := getMySQLDB()
+	if err != nil {
+		return 0, "", fmt.Errorf("mysql unavailable: %w", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to begin provisioning transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	email := sub
+	if !strings.Contains(email, "@") {
+		email = sub + "@jit.invalid" // never a real deliverable address — placeholder only
+	}
+
+	res, err := tx.ExecContext(ctx,
+		"INSERT INTO users (external_subject, email, display_name, status) VALUES (?, ?, ?, 'ACTIVE')",
+		sub, email, sub,
+	)
+	if err != nil {
+		return 0, "", err // caller checks for a duplicate-key race
+	}
+	newID, err := res.LastInsertId()
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to read new user id: %w", err)
+	}
+
+	var miscTeamID int64
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM teams WHERE is_default = TRUE LIMIT 1").Scan(&miscTeamID); err != nil {
+		return 0, "", fmt.Errorf("failed to resolve default team: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE users SET team_id = ? WHERE id = ?", miscTeamID, newID); err != nil {
+		return 0, "", fmt.Errorf("failed to assign default team: %w", err)
+	}
+
+	var roleID int64
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'READ_ONLY_ANALYST'").Scan(&roleID); err != nil {
+		return 0, "", fmt.Errorf("failed to resolve default role: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)", newID, roleID); err != nil {
+		return 0, "", fmt.Errorf("failed to assign default role: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, "", fmt.Errorf("failed to commit provisioning transaction: %w", err)
+	}
+	return newID, "ACTIVE", nil
+}
+
+// GetLedTeamIDs returns the team IDs a user leads (team_leads rows), or an
+// empty slice if they lead none. Deliberately uncached — unlike
+// GetUserPermissions, this is a single indexed lookup (idx_team_leads_user)
+// and team-lead changes are rare, so a second cache to keep in sync with
+// InvalidateUserPermissions would be complexity with no real payoff.
+func GetLedTeamIDs(ctx context.Context, userID int64) ([]int64, error) {
+	db, err := getMySQLDB()
+	if err != nil {
+		return nil, fmt.Errorf("mysql unavailable: %w", err)
+	}
+	rows, err := db.QueryContext(ctx, "SELECT team_id FROM team_leads WHERE user_id = ?", userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve led teams: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan led team id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return ids, nil
 }
 
 // RecordAuditEvent inserts one audit_log row. actorUserID is nil for

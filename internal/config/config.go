@@ -20,10 +20,10 @@ var (
 	// Kafka
 	KafkaBrokers         = getEnv("KAFKA_BROKERS", "localhost:9092")
 	RulesTopic           = getEnv("RULES_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RULES")
-	ResultsTopic          = getEnv("RESULTS_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RESULTS")
-	ResultsConsumerGroup  = getEnv("RESULTS_CONSUMER_GROUP", "velocity-cp-results")
-	AnomalyTopic          = getEnv("ANOMALY_TOPIC", "DE.AUTH.VELOCITY_ENGINE.ANOMALIES")
-	AnomalyConsumerGroup  = getEnv("ANOMALY_CONSUMER_GROUP", "velocity-cp-anomalies")
+	ResultsTopic         = getEnv("RESULTS_TOPIC", "DE.AUTH.VELOCITY_ENGINE.RESULTS")
+	ResultsConsumerGroup = getEnv("RESULTS_CONSUMER_GROUP", "velocity-cp-results")
+	AnomalyTopic         = getEnv("ANOMALY_TOPIC", "DE.AUTH.VELOCITY_ENGINE.ANOMALIES")
+	AnomalyConsumerGroup = getEnv("ANOMALY_CONSUMER_GROUP", "velocity-cp-anomalies")
 
 	// ClickHouse
 	ClickHouseHost     = getEnv("CLICKHOUSE_HOST", "localhost")
@@ -34,12 +34,12 @@ var (
 	ClickHouseTable    = getEnv("CLICKHOUSE_TABLE", "velocity_rule_results")
 
 	// Iceberg / S3
-	IcebergURI      = getEnv("ICEBERG_URI", "thrift://localhost:9083")
-	S3Endpoint      = getEnv("S3_ENDPOINT", "http://localhost:9000")
-	S3AccessKey     = getEnv("S3_ACCESS_KEY", "")
-	S3SecretKey     = getEnv("S3_SECRET_KEY", "")
-	IcebergTable    = getEnv("ICEBERG_TABLE", "stream_auth.auth_txn_raw_union_v1")
-	IcebergS3Path   = getEnv("ICEBERG_S3_PATH", "s3://warehouse/stream_auth.db/auth_txn_raw_union_v1")
+	IcebergURI    = getEnv("ICEBERG_URI", "thrift://localhost:9083")
+	S3Endpoint    = getEnv("S3_ENDPOINT", "http://localhost:9000")
+	S3AccessKey   = getEnv("S3_ACCESS_KEY", "")
+	S3SecretKey   = getEnv("S3_SECRET_KEY", "")
+	IcebergTable  = getEnv("ICEBERG_TABLE", "stream_auth.auth_txn_raw_union_v1")
+	IcebergS3Path = getEnv("ICEBERG_S3_PATH", "s3://warehouse/stream_auth.db/auth_txn_raw_union_v1")
 
 	// LiveStore
 	LiveStoreMaxRows = getEnvInt("LIVE_STORE_MAX_ROWS", 50000)
@@ -69,6 +69,16 @@ var (
 	// authorization checks fail closed (503) instead of trusting old data forever.
 	RBACPermissionMaxStaleSeconds = getEnvInt("RBAC_PERMISSION_MAX_STALE_SECONDS", 1800)
 
+	// JITProvisionRateLimitPerMinute bounds how many new users a single
+	// source IP may trigger auto-provisioning for per minute (see
+	// internal/services/rbac.go's GetOrProvisionUserByExternalSubject). A
+	// compensating control for JIT auto-provisioning's real exposure: the
+	// backend's identity layer trusts the client-supplied X-User-Subject
+	// header without cryptographic verification (see IdentityMiddleware's
+	// doc comment), so without this bound, auto-creating a user for every
+	// unrecognized subject would let anyone who can reach this backend mint
+	// unlimited accounts just by varying the header value.
+	JITProvisionRateLimitPerMinute = getEnvInt("JIT_PROVISION_RATE_LIMIT_PER_MINUTE", 5)
 )
 
 func init() {
