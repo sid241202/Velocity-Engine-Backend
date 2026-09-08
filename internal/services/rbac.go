@@ -322,12 +322,29 @@ func provisionUserByExternalSubject(ctx context.Context, sub string) (userID int
 		return 0, "", fmt.Errorf("failed to read new user id: %w", err)
 	}
 
+	// Team assignment is best-effort in an environment that hasn't run
+	// 0003_add_teams.sql yet (missing `teams` table, or `users` missing its
+	// `team_id` column) — a JIT-provisioned user still gets created and
+	// granted READ_ONLY_ANALYST below either way. A super admin or team
+	// lead can assign a real team later once that migration runs; this must
+	// never block basic login/provisioning on a table this environment
+	// doesn't have yet.
 	var miscTeamID int64
-	if err := tx.QueryRowContext(ctx, "SELECT id FROM teams WHERE is_default = TRUE LIMIT 1").Scan(&miscTeamID); err != nil {
-		return 0, "", fmt.Errorf("failed to resolve default team: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE users SET team_id = ? WHERE id = ?", miscTeamID, newID); err != nil {
-		return 0, "", fmt.Errorf("failed to assign default team: %w", err)
+	teamLookupErr := tx.QueryRowContext(ctx, "SELECT id FROM teams WHERE is_default = TRUE LIMIT 1").Scan(&miscTeamID)
+	switch {
+	case teamLookupErr == nil:
+		if _, err := tx.ExecContext(ctx, "UPDATE users SET team_id = ? WHERE id = ?", miscTeamID, newID); err != nil {
+			if !isMissingSchemaError(err) {
+				return 0, "", fmt.Errorf("failed to assign default team: %w", err)
+			}
+			metrics.MySQLOptionalTableMissing.WithLabelValues("users.team_id").Set(1)
+			slog.Warn("users.team_id column not present — provisioning user without a team assignment", "external_subject", sub)
+		}
+	case isMissingSchemaError(teamLookupErr):
+		metrics.MySQLOptionalTableMissing.WithLabelValues("teams").Set(1)
+		slog.Warn("teams table not present — provisioning user without a team assignment", "external_subject", sub)
+	default:
+		return 0, "", fmt.Errorf("failed to resolve default team: %w", teamLookupErr)
 	}
 
 	var roleID int64
@@ -356,6 +373,11 @@ func GetLedTeamIDs(ctx context.Context, userID int64) ([]int64, error) {
 	}
 	rows, err := db.QueryContext(ctx, "SELECT team_id FROM team_leads WHERE user_id = ?", userID)
 	if err != nil {
+		if isMissingSchemaError(err) {
+			metrics.MySQLOptionalTableMissing.WithLabelValues("team_leads").Set(1)
+			slog.Warn("team_leads table not present in this environment — treating this user as leading no teams", "user_id", userID)
+			return []int64{}, nil
+		}
 		return nil, fmt.Errorf("failed to resolve led teams: %w", err)
 	}
 	defer rows.Close()

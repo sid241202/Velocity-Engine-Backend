@@ -83,6 +83,37 @@ var (
 		Help: "Messages dropped because a connection's outbox was full, by stream and reason.",
 	}, []string{"stream", "reason"})
 
+	// WebSocketHeartbeatSkippedTotal counts a heartbeat tick that couldn't be
+	// enqueued because the outbox was already full of real data — a
+	// near-miss, not a disconnect (see internal/handlers/websocket.go, which
+	// deliberately keeps the connection open in this case: outbox-full from
+	// real traffic is proof of liveness, not a dead connection). A rising
+	// rate here means connections are running close to outboxSize under
+	// current load — worth watching alongside websocket_dropped_messages_total,
+	// which is the actual data-loss signal this metric is not.
+	WebSocketHeartbeatSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "websocket_heartbeat_skipped_total",
+		Help: "Heartbeat ticks skipped because the outbox was already full of real data, by stream.",
+	}, []string{"stream"})
+
+	// MySQLOptionalTableMissing is set to 1 the moment this backend detects a
+	// given optional table or column doesn't exist (MySQL error 1146 or
+	// 1054 — see isMissingSchemaError in internal/services/mysql.go) and
+	// degrades the corresponding feature gracefully instead of failing
+	// closed — see internal/services/rbac.go's GetLedTeamIDs/
+	// provisionUserByExternalSubject and rule_store.go's
+	// SaveNewRuleVersion/LoadActiveRules. A dashboard should treat any
+	// non-zero value here as "this environment's schema is behind what the
+	// code expects" — worth fixing by provisioning the named migration, not
+	// a steady-state condition to leave alone indefinitely. Label values are
+	// a small, fixed, code-controlled set (table names, or "users.team_id"
+	// for the one tolerated column) — never derived from user input — so
+	// this carries no unbounded-cardinality risk.
+	MySQLOptionalTableMissing = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "mysql_optional_table_missing",
+		Help: "1 if this optional table/column was found missing and its feature is running in degraded/tolerant mode, by table.",
+	}, []string{"table"})
+
 	// ClickHouseQueryDuration/ErrorsTotal's query_type is one of exactly 3
 	// named queries this backend issues (live_results, live_results_multi,
 	// agg_results) — see internal/services/clickhouse.go.
@@ -205,6 +236,7 @@ func init() {
 		HTTPRequestsTotal, HTTPRequestDuration,
 		KafkaMessagesConsumedTotal, KafkaConsumerLag,
 		WebSocketActiveConnections, WebSocketBroadcastDuration, WebSocketDroppedTotal,
+		WebSocketHeartbeatSkippedTotal, MySQLOptionalTableMissing,
 		ClickHouseQueryDuration, ClickHouseErrorsTotal,
 		DuckDBQueryDuration, DuckDBErrorsTotal,
 		MySQLQueryDuration,

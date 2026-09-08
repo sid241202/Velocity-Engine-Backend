@@ -17,17 +17,27 @@ import (
 // queued before Broadcast/WriteToConn start dropping messages for it
 // instead of blocking the caller. Broadcast's caller is the Kafka consumer
 // goroutine, so a slow/stalled client must never be able to stall message
-// consumption for every other subscriber.
-const outboxSize = 64
+// consumption for every other subscriber. Sized generously (not the
+// original 64) for real production event volume, where a single window
+// close on a high-cardinality grouping key can legitimately enqueue many
+// result rows in a single burst — this is headroom against that burst
+// depth, not a fix for a genuinely slow consumer (which ErrOutboxFull
+// still correctly detects and drops for, just at a higher threshold).
+const outboxSize = 256
 
 // writeDeadline bounds how long a single WriteMessage call may block on the
 // network once the writer goroutine picks a message off the outbox — a
 // backstop for a connection that accepts writes but drains them slowly.
 const writeDeadline = 10 * time.Second
 
-// errOutboxFull is returned by WriteToConn when a connection's outbox is
-// already saturated — the client can't keep up even with a heartbeat.
-var errOutboxFull = errors.New("websocket outbox full")
+// ErrOutboxFull is returned by WriteToConn when a connection's outbox is
+// already saturated. Exported so callers (internal/handlers/websocket.go's
+// heartbeat senders) can distinguish this specific, often-benign condition
+// — the outbox is full of real data, which is itself proof the connection
+// is alive — from a genuine write/connection failure, which is not benign
+// and should still disconnect. Do not treat this as equivalent to a dead
+// connection.
+var ErrOutboxFull = errors.New("websocket outbox full")
 
 // WSManager manages WebSocket connections subscribed to rule IDs.
 // Thread-safe with sync.RWMutex.
@@ -163,7 +173,7 @@ func (m *WSManager) Disconnect(conn *websocket.Conn) {
 // WriteToConn queues a message for a specific connection's writer
 // goroutine. msgType is accepted for signature compatibility with callers
 // but the writer always sends websocket.TextMessage — the only type any
-// caller in this codebase ever uses. Returns errOutboxFull if the
+// caller in this codebase ever uses. Returns ErrOutboxFull if the
 // connection can't even accept a heartbeat right now.
 func (m *WSManager) WriteToConn(conn *websocket.Conn, msgType int, data []byte) error {
 	m.mu.RLock()
@@ -173,7 +183,7 @@ func (m *WSManager) WriteToConn(conn *websocket.Conn, msgType int, data []byte) 
 		return nil // connection was removed; nothing to do
 	}
 	if !entry.enqueue(data) {
-		return errOutboxFull
+		return ErrOutboxFull
 	}
 	return nil
 }

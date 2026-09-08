@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,6 +10,7 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/services"
 	"velocity-engine-control-plane-backend-go/internal/config"
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -89,6 +91,16 @@ func (h *WSHandler) LiveAnalysisWS(c *gin.Context) {
 			if isTimeout(err) {
 				heartbeatMsg, _ := json.Marshal(map[string]string{"type": "heartbeat"})
 				if writeErr := h.wsManager.WriteToConn(conn, websocket.TextMessage, heartbeatMsg); writeErr != nil {
+					if errors.Is(writeErr, services.ErrOutboxFull) {
+						// The outbox is full of real data, not evidence of a
+						// dead connection — real broadcasts already prove
+						// this client is alive and being served. Skip this
+						// heartbeat tick rather than disconnecting a
+						// perfectly healthy, busy connection.
+						metrics.WebSocketHeartbeatSkippedTotal.WithLabelValues("live").Inc()
+						slog.Warn("Heartbeat skipped — outbox full of real data, connection stays open", "stream", "live")
+						continue
+					}
 					slog.Error("Failed to send heartbeat", "error", writeErr)
 					return
 				}
@@ -174,6 +186,11 @@ func (h *WSHandler) AnomalyAnalysisWS(c *gin.Context) {
 			if isTimeout(err) {
 				heartbeatMsg, _ := json.Marshal(map[string]string{"type": "heartbeat"})
 				if writeErr := h.anomalyWSMgr.WriteToConn(conn, websocket.TextMessage, heartbeatMsg); writeErr != nil {
+					if errors.Is(writeErr, services.ErrOutboxFull) {
+						metrics.WebSocketHeartbeatSkippedTotal.WithLabelValues("anomaly").Inc()
+						slog.Warn("Heartbeat skipped — outbox full of real data, connection stays open", "stream", "anomaly")
+						continue
+					}
 					slog.Error("AnomalyAnalysisWS heartbeat failed", "error", writeErr)
 					return
 				}

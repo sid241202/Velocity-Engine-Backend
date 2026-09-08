@@ -11,8 +11,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
+	"velocity-engine-control-plane-backend-go/internal/metrics"
 	"velocity-engine-control-plane-backend-go/internal/models"
 	"velocity-engine-control-plane-backend-go/internal/store"
 )
@@ -83,7 +85,17 @@ func SaveNewRuleVersion(ctx context.Context, rule *models.VelocityRule, version 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, ruleRowID, w.Type, w.SizeMs, w.SlideMs, w.TimeType, w.TimestampField, w.TimestampFormat,
 		w.AllowedLatenessMs, w.AlignmentOffsetMs, w.UseKafkaTimestamp); err != nil {
-		return fmt.Errorf("failed to insert window config: %w", err)
+		if !isMissingSchemaError(err) {
+			return fmt.Errorf("failed to insert window config: %w", err)
+		}
+		// window_configs not provisioned in this environment yet — the rule
+		// still saves and publishes correctly (Flink gets its windowing
+		// config from the Kafka RULES payload, not from this table; this
+		// table only lets a restarted backend reconstruct it via
+		// LoadActiveRules below). Not fatal: log loudly so it isn't
+		// mistaken for a healthy environment, and keep going.
+		metrics.MySQLOptionalTableMissing.WithLabelValues("window_configs").Set(1)
+		slog.Warn("window_configs table not present — rule saved without persisted windowing config; it will not survive a backend restart until this table is provisioned", "rule_id", ruleID)
 	}
 
 	var aggOn, anomalyOn, storeOn bool
@@ -228,25 +240,34 @@ func LoadActiveRules(ctx context.Context) (map[string]*models.RuleRecord, error)
 			timestamp_field, timestamp_format, allowed_lateness_ms, alignment_offset_ms, use_kafka_timestamp
 		FROM window_configs WHERE rule_row_id IN `+inClause, rowIDs...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query window configs: %w", err)
-	}
-	for wRows.Next() {
-		var rowID int64
-		var w models.WindowingConfig
-		var timestampField, timestampFormat sql.NullString
-		if err := wRows.Scan(&rowID, &w.Type, &w.SizeMs, &w.SlideMs, &w.TimeType,
-			&timestampField, &timestampFormat, &w.AllowedLatenessMs, &w.AlignmentOffsetMs, &w.UseKafkaTimestamp); err != nil {
-			wRows.Close()
-			return nil, fmt.Errorf("failed to scan window config: %w", err)
+		if !isMissingSchemaError(err) {
+			return nil, fmt.Errorf("failed to query window configs: %w", err)
 		}
-		w.TimestampField = timestampField.String
-		w.TimestampFormat = timestampFormat.String
-		windows[rowID] = w
-	}
-	wRowsErr := wRows.Err()
-	wRows.Close()
-	if wRowsErr != nil {
-		return nil, fmt.Errorf("window_configs rows iteration error: %w", wRowsErr)
+		// window_configs not provisioned in this environment yet — every
+		// rule below loads with a zero-value WindowingConfig instead of
+		// failing rule loading entirely. Matches the persistence-side
+		// tolerance in SaveNewRuleVersion above.
+		metrics.MySQLOptionalTableMissing.WithLabelValues("window_configs").Set(1)
+		slog.Warn("window_configs table not present — loading active rules without persisted windowing config")
+	} else {
+		for wRows.Next() {
+			var rowID int64
+			var w models.WindowingConfig
+			var timestampField, timestampFormat sql.NullString
+			if err := wRows.Scan(&rowID, &w.Type, &w.SizeMs, &w.SlideMs, &w.TimeType,
+				&timestampField, &timestampFormat, &w.AllowedLatenessMs, &w.AlignmentOffsetMs, &w.UseKafkaTimestamp); err != nil {
+				wRows.Close()
+				return nil, fmt.Errorf("failed to scan window config: %w", err)
+			}
+			w.TimestampField = timestampField.String
+			w.TimestampFormat = timestampFormat.String
+			windows[rowID] = w
+		}
+		wRowsErr := wRows.Err()
+		wRows.Close()
+		if wRowsErr != nil {
+			return nil, fmt.Errorf("window_configs rows iteration error: %w", wRowsErr)
+		}
 	}
 
 	type sinkRow struct {
