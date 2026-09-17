@@ -225,6 +225,13 @@ func main() {
 	router.PUT("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "update"), rulesHandler.UpdateRule)
 	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "delete"), rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
+	// Scalable group browsing for high-cardinality grouping keys — ranks
+	// groups server-side in ClickHouse (top-groups) and fetches one exact
+	// group's full history on demand (group-detail), instead of ever
+	// shipping every group's raw rows to the browser. Read-only, same
+	// unguarded policy as the other analysis routes above.
+	router.GET("/rules/:rule_id/top-groups", analysisHandler.TopGroupsAnalysis)
+	router.GET("/rules/:rule_id/group-detail", analysisHandler.GroupDetailAnalysis)
 
 	// WebSocket routes
 	router.GET("/ws/live-analysis", wsHandler.LiveAnalysisWS)
