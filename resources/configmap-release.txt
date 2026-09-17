@@ -34,7 +34,7 @@ ICEBERG_TABLE=stream_auth.auth_txn_raw_union_v1  # Iceberg table name for raw au
 ICEBERG_S3_PATH=s3://warehouse/stream_auth.db/auth_txn_raw_union_v1  # S3 path to the Iceberg table's warehouse location
 
 LIVE_STORE_MAX_ROWS=50000  # max rows retained in the in-memory LiveStore
-LIVE_STORE_HOURS=24  # hours of history the LiveStore bootstraps from ClickHouse at startup
+LIVE_STORE_HOURS=1  # hours of live-result history retained — bounds both the startup ClickHouse bootstrap AND the ongoing background prune (internal/services/livestore.go); keep in sync with the frontend's LiveAnalysis.jsx LIVE_WINDOW_HOURS
 WS_HEARTBEAT_INTERVAL=30  # WebSocket heartbeat/ping interval, in seconds
 
 MYSQL_HOST=localhost  # MySQL host for the RBAC store and rule store

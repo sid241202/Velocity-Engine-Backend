@@ -43,8 +43,18 @@ var (
 
 	// LiveStore
 	LiveStoreMaxRows = getEnvInt("LIVE_STORE_MAX_ROWS", 50000)
-	LiveStoreHours   = getEnvInt("LIVE_STORE_HOURS", 24)
-	WSHeartbeatSec   = getEnvInt("WS_HEARTBEAT_INTERVAL", 30)
+	// LiveStoreHours bounds both the startup bootstrap-from-ClickHouse pull
+	// (main.go) and the ongoing background pruning in
+	// internal/services/livestore.go's pruneStale — it is the actual,
+	// continuously-enforced retention window for everything GetAll can ever
+	// return (the "hours" query param on GET /rules/live-analysis is parsed
+	// but not yet wired to anything narrower — see that handler). Matches the
+	// frontend's own LIVE_WINDOW_HOURS in LiveAnalysis.jsx; keep both in sync
+	// if either changes; changing only one of them still "works" but the
+	// unmatched side won't get the memory/bandwidth benefit of the smaller
+	// window.
+	LiveStoreHours = getEnvInt("LIVE_STORE_HOURS", 1)
+	WSHeartbeatSec = getEnvInt("WS_HEARTBEAT_INTERVAL", 30)
 
 	// MySQL (RBAC store)
 	MySQLHost         = getEnv("MYSQL_HOST", "localhost")
