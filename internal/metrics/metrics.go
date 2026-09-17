@@ -96,16 +96,19 @@ var (
 		Help: "Heartbeat ticks skipped because the outbox was already full of real data, by stream.",
 	}, []string{"stream"})
 
-	// MySQLOptionalTableMissing was set to 1 when this backend detected a
-	// given optional table or column missing and degraded the corresponding
-	// feature gracefully instead of failing closed. That tolerant behavior
-	// no longer exists anywhere in this codebase (the multi-team RBAC
-	// extension was removed, and rule_store.go's window_configs handling now
-	// fails closed like every other required table) — kept registered so any
-	// existing dashboard panel referencing it doesn't break, but nothing
-	// currently sets it. Label values, if this is ever used again, should
-	// stay a small, fixed, code-controlled set (table names) — never derived
-	// from user input.
+	// MySQLOptionalTableMissing is set to 1 the moment this backend detects a
+	// given optional table doesn't exist (MySQL error 1146 or 1054 — see
+	// isMissingSchemaError in internal/services/mysql.go) and degrades the
+	// corresponding feature gracefully instead of failing closed — currently
+	// just rule_store.go's window_configs handling (SaveNewRuleVersion/
+	// LoadActiveRules), by explicit user instruction that a missing
+	// window_configs table must never block rule create/edit or the
+	// active-rules reload. A dashboard should treat any non-zero value here
+	// as "this environment's schema is behind what the code expects" — worth
+	// fixing by provisioning the named migration, not a steady-state
+	// condition to leave alone indefinitely. Label values are a small,
+	// fixed, code-controlled set (table names) — never derived from user
+	// input — so this carries no unbounded-cardinality risk.
 	MySQLOptionalTableMissing = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mysql_optional_table_missing",
 		Help: "1 if this optional table/column was found missing and its feature is running in degraded/tolerant mode, by table.",

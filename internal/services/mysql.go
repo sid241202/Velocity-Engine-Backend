@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,6 +11,8 @@ import (
 
 	"velocity-engine-control-plane-backend-go/internal/config"
 	"velocity-engine-control-plane-backend-go/internal/metrics"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 var (
@@ -190,4 +193,23 @@ func verifyMySQLSchemaImpl(ctx context.Context) error {
 
 	slog.Info("MySQL schema verified", "database", config.MySQLDatabase, "tables", requiredTables)
 	return nil
+}
+
+// isMissingSchemaError reports whether err is one of the two MySQL error
+// codes this backend tolerates for a table or column not yet provisioned in
+// a given environment: 1146 (ER_NO_SUCH_TABLE — e.g. window_configs) or 1054
+// (ER_BAD_FIELD_ERROR, an unknown column). Callers use this to degrade a
+// single optional feature gracefully — log loudly and continue — rather
+// than failing the whole request, per explicit user instruction (2026-09-18)
+// that window_configs specifically must never block rule create/edit or the
+// active-rules reload. Any other error (a real connectivity failure, a
+// syntax error, a constraint violation) must still propagate and fail
+// closed as before; this must never become a blanket "ignore MySQL errors"
+// check.
+func isMissingSchemaError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1146 || mysqlErr.Number == 1054
 }
