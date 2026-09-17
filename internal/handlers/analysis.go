@@ -168,6 +168,80 @@ func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
+// TopGroupsAnalysis handles GET /rules/:rule_id/top-groups — ranks a rule's
+// distinct groupKeys by breach activity, aggregated server-side in
+// ClickHouse. This is the scalable alternative to paging through
+// AggAnalysis's raw rows for rules whose grouping key is high-cardinality
+// (some finger-auth fraud rules see 100k-600k+ concurrent groups at peak —
+// see PRODUCTION_CAPACITY_SPECS.txt): the LIMIT here caps ranked GROUPS, not
+// raw rows, so results are never silently truncated to an arbitrary recency
+// window before the worst offenders are even considered.
+func (h *AnalysisHandler) TopGroupsAnalysis(c *gin.Context) {
+	ruleID := c.Param("rule_id")
+	startTSRaw, _ := url.QueryUnescape(c.Query("start_ts"))
+	endTSRaw, _ := url.QueryUnescape(c.Query("end_ts"))
+	startTS := strings.TrimSpace(startTSRaw)
+	endTS := strings.TrimSpace(endTSRaw)
+
+	if ruleID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "rule_id is required."})
+		return
+	}
+	if startTS == "" || endTS == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Start and end timestamps are required."})
+		return
+	}
+
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if err != nil || limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+
+	groups, err := services.GetTopGroups(c.Request.Context(), ruleID, startTS, endTS, limit, offset)
+	if err != nil {
+		slog.Error("Failed to get top groups", "rule_id", ruleID, "start_ts", startTS, "end_ts", endTS, "error", err)
+		respondClickHouseError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"groups": groups, "limit": limit, "offset": offset})
+}
+
+// GroupDetailAnalysis handles GET /rules/:rule_id/group-detail?key=... — the
+// drill-in companion to TopGroupsAnalysis: once an analyst picks one exact
+// groupKey (from the ranked list, or one they already know), this returns
+// just that group's full window history, never every other group's rows.
+func (h *AnalysisHandler) GroupDetailAnalysis(c *gin.Context) {
+	ruleID := c.Param("rule_id")
+	groupKey := c.Query("key")
+	startTSRaw, _ := url.QueryUnescape(c.Query("start_ts"))
+	endTSRaw, _ := url.QueryUnescape(c.Query("end_ts"))
+	startTS := strings.TrimSpace(startTSRaw)
+	endTS := strings.TrimSpace(endTSRaw)
+
+	if ruleID == "" || groupKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "rule_id and key are required."})
+		return
+	}
+	if startTS == "" || endTS == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Start and end timestamps are required."})
+		return
+	}
+
+	rows, err := services.GetGroupDetail(c.Request.Context(), ruleID, groupKey, startTS, endTS)
+	if err != nil {
+		slog.Error("Failed to get group detail", "rule_id", ruleID, "group_key", groupKey, "error", err)
+		respondClickHouseError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"results": rows})
+}
+
 // HistoricalTest handles POST /rules/historical-test
 func (h *AnalysisHandler) HistoricalTest(c *gin.Context) {
 	var rule models.VelocityRule

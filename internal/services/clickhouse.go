@@ -336,6 +336,150 @@ func getAggResultsImpl(ctx context.Context, ruleIDs []string, startTS, endTS str
 	return grouped, nil
 }
 
+// GroupSummary is one ranked row from GetTopGroups — a group's breach
+// activity summary within a time range, computed entirely in ClickHouse.
+type GroupSummary struct {
+	GroupKey        string  `json:"groupKey"`
+	TotalWindows    int64   `json:"totalWindows"`
+	BreachedWindows int64   `json:"breachedWindows"`
+	BreachRate      float64 `json:"breachRate"`
+	LastSeen        string  `json:"lastSeen"`
+}
+
+// GetTopGroups ranks a rule's distinct groupKeys by breach activity within a
+// time range, aggregating server-side in ClickHouse. This exists because a
+// high-cardinality grouping key (several finger-auth fraud rules see
+// 100k-600k+ concurrent groups at peak — see PRODUCTION_CAPACITY_SPECS.txt)
+// makes "fetch every raw window row and group client-side" (GetAggResults'
+// consumption pattern, still used for chart data) both slow and silently
+// lossy: that endpoint's LIMIT 5000 caps RAW ROWS ordered by recency, not by
+// which groups actually breached — for a high-cardinality rule, most groups
+// never reach the client at all, breached or not. Here LIMIT applies to
+// ranked GROUPS instead, ordered by breach count, so the analyst always sees
+// the worst offenders first regardless of total cardinality.
+func GetTopGroups(ctx context.Context, ruleID, startTS, endTS string, limit, offset int) ([]GroupSummary, error) {
+	start := time.Now()
+	result, err := getTopGroupsImpl(ctx, ruleID, startTS, endTS, limit, offset)
+	metrics.ClickHouseQueryDuration.WithLabelValues("top_groups").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.ClickHouseErrorsTotal.WithLabelValues("top_groups", chErrorClass(err)).Inc()
+	}
+	return result, err
+}
+
+func getTopGroupsImpl(ctx context.Context, ruleID, startTS, endTS string, limit, offset int) ([]GroupSummary, error) {
+	db, err := getClickHouseDB()
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse not available: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			groupKey,
+			count() AS totalWindows,
+			sum(thresholdBreached) AS breachedWindows,
+			max(windowEnd) AS lastSeen
+		FROM %s FINAL
+		WHERE ruleId = ?
+			AND windowStart >= parseDateTimeBestEffort(?)
+			AND windowStart <= parseDateTimeBestEffort(?)
+		GROUP BY groupKey
+		ORDER BY breachedWindows DESC, totalWindows DESC
+		LIMIT ? OFFSET ?`, config.ClickHouseTable)
+
+	rows, err := db.QueryContext(ctx, query, ruleID, startTS, endTS, limit, offset)
+	if err != nil {
+		ResetClickHouseConn()
+		return nil, fmt.Errorf("%w: clickhouse query failed: %v", ErrClickHouseUnavailable, err)
+	}
+	defer rows.Close()
+
+	var out []GroupSummary
+	for rows.Next() {
+		var groupKey, totalWindows, breachedWindows, lastSeen interface{}
+		if err := rows.Scan(&groupKey, &totalWindows, &breachedWindows, &lastSeen); err != nil {
+			return nil, fmt.Errorf("failed to scan top-groups row: %w", err)
+		}
+		g := GroupSummary{
+			GroupKey:        fmt.Sprintf("%v", groupKey),
+			TotalWindows:    toInt64(totalWindows),
+			BreachedWindows: toInt64(breachedWindows),
+		}
+		if t, ok := lastSeen.(time.Time); ok {
+			g.LastSeen = t.Format("2006-01-02 15:04:05")
+		}
+		if g.TotalWindows > 0 {
+			g.BreachRate = float64(g.BreachedWindows) / float64(g.TotalWindows) * 100
+		}
+		out = append(out, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	if out == nil {
+		out = []GroupSummary{}
+	}
+	return out, nil
+}
+
+// toInt64 converts a ClickHouse numeric scan result (typically uint64 for
+// count()/sum() aggregates) to int64 for JSON output, without assuming which
+// concrete numeric type the driver returned it as.
+func toInt64(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case uint64:
+		return int64(n)
+	case int32:
+		return int64(n)
+	case uint32:
+		return int64(n)
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+// GetGroupDetail returns the full per-window history for ONE exact groupKey —
+// the drill-in companion to GetTopGroups: once an analyst picks a group off
+// the ranked list (or already knows one, e.g. a specific enrolmentReferenceId
+// or deviceCode), this fetches just that group's rows without ever pulling
+// every other group's data.
+func GetGroupDetail(ctx context.Context, ruleID, groupKey, startTS, endTS string) ([]map[string]interface{}, error) {
+	start := time.Now()
+	result, err := getGroupDetailImpl(ctx, ruleID, groupKey, startTS, endTS)
+	metrics.ClickHouseQueryDuration.WithLabelValues("group_detail").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.ClickHouseErrorsTotal.WithLabelValues("group_detail", chErrorClass(err)).Inc()
+	}
+	return result, err
+}
+
+func getGroupDetailImpl(ctx context.Context, ruleID, groupKey, startTS, endTS string) ([]map[string]interface{}, error) {
+	db, err := getClickHouseDB()
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse not available: %w", err)
+	}
+
+	query := fmt.Sprintf(`SELECT * FROM %s FINAL
+		WHERE ruleId = ? AND groupKey = ?
+			AND windowStart >= parseDateTimeBestEffort(?)
+			AND windowStart <= parseDateTimeBestEffort(?)
+		ORDER BY windowStart DESC
+		LIMIT 2000`, config.ClickHouseTable)
+
+	rows, err := db.QueryContext(ctx, query, ruleID, groupKey, startTS, endTS)
+	if err != nil {
+		ResetClickHouseConn()
+		return nil, fmt.Errorf("%w: clickhouse query failed: %v", ErrClickHouseUnavailable, err)
+	}
+	defer rows.Close()
+
+	return rowsToMaps(rows)
+}
+
 // CloseClickHouse closes the ClickHouse connection pool.
 func CloseClickHouse() {
 	chDBMu.Lock()
