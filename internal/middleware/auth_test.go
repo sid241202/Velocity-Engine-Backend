@@ -25,27 +25,13 @@ func wso2DepsForTest(resolver ExternalSubjectResolver) func() {
 
 func newTestRouter(resolver PermissionResolver, resource, action string, setUserID interface{}) *gin.Engine {
 	r := gin.New()
-	authMW := NewAuthMiddleware(resolver, nil)
+	authMW := NewAuthMiddleware(resolver)
 	r.GET("/protected", func(c *gin.Context) {
 		if setUserID != nil {
 			c.Set(ContextKeyUserID, setUserID)
 		}
 		c.Next()
 	}, authMW.RequirePermission(resource, action), func(c *gin.Context) {
-		c.Status(http.StatusOK)
-	})
-	return r
-}
-
-func newAdminTestRouter(resolver PermissionResolver, ledTeamsResolver LedTeamsResolver, setUserID interface{}) *gin.Engine {
-	r := gin.New()
-	authMW := NewAuthMiddleware(resolver, ledTeamsResolver)
-	r.GET("/admin/protected", func(c *gin.Context) {
-		if setUserID != nil {
-			c.Set(ContextKeyUserID, setUserID)
-		}
-		c.Next()
-	}, authMW.RequireAdminAccess(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 	return r
@@ -230,75 +216,3 @@ func TestIdentityMiddleware_PassesSourceIPToResolver(t *testing.T) {
 	}
 }
 
-func TestRequireAdminAccess_AllowsIAMManage(t *testing.T) {
-	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
-		return []string{"SUPER_ADMIN"}, map[string]bool{"iam:manage": true}, nil
-	}
-	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
-		t.Fatal("led-teams resolver must not be consulted once iam:manage already grants access")
-		return nil, nil
-	}
-	r := newAdminTestRouter(resolver, ledTeams, int64(1))
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
-	}
-}
-
-func TestRequireAdminAccess_AllowsTeamLeadWithoutIAMManage(t *testing.T) {
-	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
-		return []string{"RULE_MANAGER"}, map[string]bool{"rules:publish": true}, nil
-	}
-	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
-		return []int64{2}, nil
-	}
-	r := newAdminTestRouter(resolver, ledTeams, int64(2))
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 for a team lead even without iam:manage, got %d (body: %s)", w.Code, w.Body.String())
-	}
-}
-
-func TestRequireAdminAccess_DeniesNeitherIAMManageNorLead(t *testing.T) {
-	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
-		return []string{"READ_ONLY_ANALYST"}, map[string]bool{"rules:read": true}, nil
-	}
-	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
-		return []int64{}, nil
-	}
-	r := newAdminTestRouter(resolver, ledTeams, int64(5))
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d (body: %s)", w.Code, w.Body.String())
-	}
-}
-
-func TestRequireAdminAccess_ServiceUnavailableOnLedTeamsResolverError(t *testing.T) {
-	resolver := func(ctx context.Context, userID int64) ([]string, map[string]bool, error) {
-		return []string{"READ_ONLY_ANALYST"}, map[string]bool{"rules:read": true}, nil
-	}
-	ledTeams := func(ctx context.Context, userID int64) ([]int64, error) {
-		return nil, errors.New("mysql unavailable")
-	}
-	r := newAdminTestRouter(resolver, ledTeams, int64(5))
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/protected", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503, got %d (body: %s)", w.Code, w.Body.String())
-	}
-}

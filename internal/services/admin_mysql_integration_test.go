@@ -1,10 +1,9 @@
 //go:build mysql_integration
 
-// Integration test against a REAL MySQL instance for the multi-team RBAC
-// extension (0003_add_teams.sql) — JIT auto-provisioning, the per-IP rate
-// limit, and UpdateUser's team-scoped enforcement. Same opt-in convention as
-// rbac_mysql_integration_test.go: apply 0001+0002+0003 to the target
-// database yourself first, then:
+// Integration test against a REAL MySQL instance for JIT auto-provisioning
+// and its per-IP rate limit. Same opt-in convention as
+// rbac_mysql_integration_test.go: apply 0001+0002 to the target database
+// yourself first, then:
 //
 //	MYSQL_HOST=... MYSQL_PORT=... MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=... \
 //	  go test -tags mysql_integration -v ./internal/services/... -run TestAdminMySQLIntegration
@@ -25,7 +24,7 @@ func TestAdminMySQLIntegration_JITProvisioningAndRateLimit(t *testing.T) {
 	defer cancel()
 
 	if err := VerifyMySQLSchema(ctx); err != nil {
-		t.Fatalf("VerifyMySQLSchema failed — apply 0001/0002/0003 migrations first: %v", err)
+		t.Fatalf("VerifyMySQLSchema failed — apply 0001/0002 migrations first: %v", err)
 	}
 
 	db, err := getMySQLDB()
@@ -63,18 +62,17 @@ func TestAdminMySQLIntegration_JITProvisioningAndRateLimit(t *testing.T) {
 		if status != "ACTIVE" {
 			t.Fatalf("expected new user to be ACTIVE, got %s", status)
 		}
-		var teamName, roleName string
+		var roleName string
 		if err := db.QueryRowContext(ctx, `
-			SELECT t.name, r.name FROM users u
-			JOIN teams t ON t.id = u.team_id
+			SELECT r.name FROM users u
 			JOIN user_roles ur ON ur.user_id = u.id
 			JOIN roles r ON r.id = ur.role_id
 			WHERE u.id = ?
-		`, userID).Scan(&teamName, &roleName); err != nil {
-			t.Fatalf("failed to look up provisioned user's team/role: %v", err)
+		`, userID).Scan(&roleName); err != nil {
+			t.Fatalf("failed to look up provisioned user's role: %v", err)
 		}
-		if teamName != "MISC" || roleName != "READ_ONLY_ANALYST" {
-			t.Fatalf("expected MISC/READ_ONLY_ANALYST, got team=%s role=%s", teamName, roleName)
+		if roleName != "READ_ONLY_ANALYST" {
+			t.Fatalf("expected READ_ONLY_ANALYST, got role=%s", roleName)
 		}
 		var auditCount int
 		db.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_log WHERE action='user.jit_provision' AND target_id=?", userID).Scan(&auditCount)
@@ -103,37 +101,27 @@ func TestAdminMySQLIntegration_JITProvisioningAndRateLimit(t *testing.T) {
 	}
 }
 
-func TestAdminMySQLIntegration_UpdateUserEnforcesTeamScope(t *testing.T) {
+func TestAdminMySQLIntegration_UpdateUserRoleAndSelfEditGuard(t *testing.T) {
 	ResetMySQLConn()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := VerifyMySQLSchema(ctx); err != nil {
-		t.Fatalf("VerifyMySQLSchema failed — apply 0001/0002/0003 migrations first: %v", err)
+		t.Fatalf("VerifyMySQLSchema failed — apply 0001/0002 migrations first: %v", err)
 	}
 	db, err := getMySQLDB()
 	if err != nil {
 		t.Fatalf("getMySQLDB failed: %v", err)
 	}
 
-	var teamAID, teamBID, roleEditorID, roleAnalystID, roleManagerID int64
-	res, err := db.ExecContext(ctx, "INSERT INTO teams (name) VALUES (?)", "IntegrationTeamA")
-	if err != nil {
-		t.Fatalf("failed to create team A: %v", err)
-	}
-	teamAID, _ = res.LastInsertId()
-	res, err = db.ExecContext(ctx, "INSERT INTO teams (name) VALUES (?)", "IntegrationTeamB")
-	if err != nil {
-		t.Fatalf("failed to create team B: %v", err)
-	}
-	teamBID, _ = res.LastInsertId()
+	var roleEditorID, roleManagerID, roleSuperAdminID int64
 	db.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'RULE_EDITOR'").Scan(&roleEditorID)
-	db.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'READ_ONLY_ANALYST'").Scan(&roleAnalystID)
 	db.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'RULE_MANAGER'").Scan(&roleManagerID)
+	db.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'SUPER_ADMIN'").Scan(&roleSuperAdminID)
 
-	insertUser := func(sub string, teamID int64, roleID int64) int64 {
-		res, err := db.ExecContext(ctx, "INSERT INTO users (external_subject, email, display_name, status, team_id) VALUES (?, ?, ?, 'ACTIVE', ?)",
-			sub, sub+"@example.invalid", sub, teamID)
+	insertUser := func(sub string, roleID int64) int64 {
+		res, err := db.ExecContext(ctx, "INSERT INTO users (external_subject, email, display_name, status) VALUES (?, ?, ?, 'ACTIVE')",
+			sub, sub+"@example.invalid", sub)
 		if err != nil {
 			t.Fatalf("failed to insert user %s: %v", sub, err)
 		}
@@ -144,54 +132,33 @@ func TestAdminMySQLIntegration_UpdateUserEnforcesTeamScope(t *testing.T) {
 		return id
 	}
 
-	leadID := insertUser("integration-lead-a", teamAID, roleManagerID)
-	teammateID := insertUser("integration-teammate-a", teamAID, roleEditorID)
-	outsiderID := insertUser("integration-outsider-b", teamBID, roleAnalystID)
-
-	if _, err := db.ExecContext(ctx, "INSERT INTO team_leads (team_id, user_id) VALUES (?, ?)", teamAID, leadID); err != nil {
-		t.Fatalf("failed to grant team lead: %v", err)
-	}
+	adminID := insertUser("integration-admin", roleSuperAdminID)
+	targetID := insertUser("integration-target", roleEditorID)
 
 	t.Cleanup(func() {
-		for _, id := range []int64{leadID, teammateID, outsiderID} {
+		for _, id := range []int64{adminID, targetID} {
 			db.ExecContext(context.Background(), "DELETE FROM users WHERE id = ?", id)
 		}
-		db.ExecContext(context.Background(), "DELETE FROM teams WHERE id IN (?, ?)", teamAID, teamBID)
 	})
 
-	// The lead can edit their own teammate.
-	if _, err := UpdateUser(ctx, leadID, teammateID, UserPatch{Role: "RULE_MANAGER", TeamID: &teamAID, Status: "ACTIVE"}); err != nil {
-		t.Fatalf("expected lead to be able to update their own teammate, got: %v", err)
+	// An iam:manage actor can update another user's role/status.
+	if _, err := UpdateUser(ctx, adminID, targetID, UserPatch{Role: "RULE_MANAGER", Status: "ACTIVE"}); err != nil {
+		t.Fatalf("expected admin to be able to update the target user, got: %v", err)
 	}
 
-	// The lead cannot touch a user in a different team.
-	if _, err := UpdateUser(ctx, leadID, outsiderID, UserPatch{Role: "RULE_EDITOR", TeamID: &teamAID, Status: "ACTIVE"}); !errors.Is(err, ErrForbiddenScope) {
-		t.Fatalf("expected ErrForbiddenScope for an out-of-team target, got: %v", err)
-	}
-
-	// The lead cannot grant SUPER_ADMIN even to their own teammate.
-	if _, err := UpdateUser(ctx, leadID, teammateID, UserPatch{Role: "SUPER_ADMIN", TeamID: nil, Status: "ACTIVE"}); !errors.Is(err, ErrForbiddenScope) {
-		t.Fatalf("expected ErrForbiddenScope when a lead attempts to grant SUPER_ADMIN, got: %v", err)
-	}
-
-	// The lead cannot move their teammate to a team they don't lead.
-	if _, err := UpdateUser(ctx, leadID, teammateID, UserPatch{Role: "RULE_EDITOR", TeamID: &teamBID, Status: "ACTIVE"}); !errors.Is(err, ErrForbiddenScope) {
-		t.Fatalf("expected ErrForbiddenScope when moving a teammate to a non-led team, got: %v", err)
-	}
-
-	// Self-edit is blocked even for the lead acting on themselves.
-	if _, err := UpdateUser(ctx, leadID, leadID, UserPatch{Role: "RULE_MANAGER", TeamID: &teamAID, Status: "ACTIVE"}); !errors.Is(err, ErrCannotEditSelf) {
+	// Self-edit is blocked even for a super admin acting on themselves.
+	if _, err := UpdateUser(ctx, adminID, adminID, UserPatch{Role: "RULE_MANAGER", Status: "ACTIVE"}); !errors.Is(err, ErrCannotEditSelf) {
 		t.Fatalf("expected ErrCannotEditSelf, got: %v", err)
 	}
 
-	// Cache invalidation: the teammate's cached permissions must reflect the
-	// role change from the very first update above, with no manual wait.
-	InvalidateUserPermissions(teammateID) // ensure a clean baseline before re-asserting
-	_, perms, err := GetUserPermissions(ctx, teammateID)
+	// Cache invalidation: the target's cached permissions must reflect the
+	// role change from the update above, with no manual wait.
+	InvalidateUserPermissions(targetID) // ensure a clean baseline before re-asserting
+	_, perms, err := GetUserPermissions(ctx, targetID)
 	if err != nil {
 		t.Fatalf("GetUserPermissions failed: %v", err)
 	}
 	if !perms["rules:publish"] {
-		t.Fatalf("expected teammate's permissions to reflect RULE_MANAGER after the update, got: %v", perms)
+		t.Fatalf("expected target's permissions to reflect RULE_MANAGER after the update, got: %v", perms)
 	}
 }

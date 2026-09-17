@@ -94,7 +94,7 @@ func main() {
 			slog.Error("MySQL schema verification failed — RBAC-protected routes and rule persistence will be unavailable until this is resolved", "error", err)
 		}
 	}()
-	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions, services.GetLedTeamIDs)
+	authMW := middleware.NewAuthMiddleware(services.GetUserPermissions)
 
 	// Wires IdentityMiddleware's real resolver dependency (see that
 	// function's doc comment for the current trust model). Uses
@@ -187,24 +187,14 @@ func main() {
 	// hydrate its authorization context (which UI elements to show/hide).
 	router.GET("/me", middleware.IdentityMiddleware(), iamHandler.Me)
 
-	// Admin Panel — RequireAdminAccess (iam:manage OR any team leadership)
-	// gates entry to the group; the three SUPER_ADMIN-only actions (team
-	// creation, granting/revoking team leadership) additionally require
-	// iam:manage specifically, since a lead should never get to decide who
-	// else administers a team. Fine-grained per-target scoping for the
-	// GET/PATCH routes lives in internal/services/admin.go, not here — see
-	// RequireAdminAccess's own doc comment for why a static route gate can't
-	// express "your team only."
-	adminGroup := router.Group("/admin", middleware.IdentityMiddleware(), authMW.RequireAdminAccess())
+	// Admin Panel — gated on iam:manage (SUPER_ADMIN only). No narrower
+	// per-target scoping applies below this; see internal/services/admin.go.
+	adminGroup := router.Group("/admin", middleware.IdentityMiddleware(), authMW.RequirePermission("iam", "manage"))
 	{
 		adminGroup.GET("/users", adminHandler.ListUsers)
 		adminGroup.PATCH("/users/:id", adminHandler.UpdateUser)
-		adminGroup.GET("/teams", adminHandler.ListTeams)
 		adminGroup.GET("/roles", adminHandler.ListRoles)
 		adminGroup.GET("/audit-log", adminHandler.ListAuditLog)
-		adminGroup.POST("/teams", authMW.RequirePermission("iam", "manage"), adminHandler.CreateTeam)
-		adminGroup.POST("/teams/:id/leads", authMW.RequirePermission("iam", "manage"), adminHandler.GrantTeamLead)
-		adminGroup.DELETE("/teams/:id/leads/:userId", authMW.RequirePermission("iam", "manage"), adminHandler.RevokeTeamLead)
 	}
 
 	// Static paths BEFORE parameterized routes to avoid conflicts

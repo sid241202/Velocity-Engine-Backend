@@ -127,24 +127,15 @@ func IdentityMiddleware() gin.HandlerFunc {
 // without a real MySQL connection.
 type PermissionResolver func(ctx context.Context, userID int64) (roles []string, perms map[string]bool, err error)
 
-// LedTeamsResolver resolves which team IDs a user leads. Matches
-// services.GetLedTeamIDs's signature — injected for the same reason
-// PermissionResolver is (keeps this package free of internal/services'
-// go-duckdb/cgo dependency). Used by RequireAdminAccess to decide whether a
-// non-iam:manage user still belongs in the Admin Panel as a team lead.
-type LedTeamsResolver func(ctx context.Context, userID int64) ([]int64, error)
-
-// AuthMiddleware holds the resolvers used to build RequirePermission/
-// RequireAdminAccess guards. Construct once at startup with
-// services.GetUserPermissions and services.GetLedTeamIDs.
+// AuthMiddleware holds the resolver used to build RequirePermission guards.
+// Construct once at startup with services.GetUserPermissions.
 type AuthMiddleware struct {
-	Resolver         PermissionResolver
-	LedTeamsResolver LedTeamsResolver
+	Resolver PermissionResolver
 }
 
-// NewAuthMiddleware constructs an AuthMiddleware bound to the given resolvers.
-func NewAuthMiddleware(resolver PermissionResolver, ledTeamsResolver LedTeamsResolver) *AuthMiddleware {
-	return &AuthMiddleware{Resolver: resolver, LedTeamsResolver: ledTeamsResolver}
+// NewAuthMiddleware constructs an AuthMiddleware bound to the given resolver.
+func NewAuthMiddleware(resolver PermissionResolver) *AuthMiddleware {
+	return &AuthMiddleware{Resolver: resolver}
 }
 
 // RequirePermission returns middleware that aborts with 403 unless the
@@ -181,59 +172,6 @@ func (m *AuthMiddleware) RequirePermission(resource, action string) gin.HandlerF
 		if !perms[required] {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 				"detail": "Insufficient permissions: requires " + required,
-			})
-			return
-		}
-
-		c.Next()
-	}
-}
-
-// RequireAdminAccess gates the /admin/* route group: full access via
-// iam:manage (SUPER_ADMIN today), or scoped access via leading at least one
-// team. This only answers "does this user belong in the Admin Panel at
-// all" — the fine-grained scoping (which users/teams/audit entries a
-// non-iam:manage actor can actually see or mutate) happens in
-// internal/services/admin.go and internal/handlers/admin.go, since it's
-// data-dependent (which team) in a way a static per-route guard can't express.
-func (m *AuthMiddleware) RequireAdminAccess() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		uidRaw, exists := c.Get(ContextKeyUserID)
-		if !exists {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "Authentication required"})
-			return
-		}
-		userID, ok := uidRaw.(int64)
-		if !ok {
-			slog.Error("auth_user_id in context has unexpected type", "value", uidRaw)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"detail": "Internal authorization error"})
-			return
-		}
-
-		_, perms, err := m.Resolver(c.Request.Context(), userID)
-		if err != nil {
-			slog.Error("Permission resolution failed", "user_id", userID, "error", err)
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"detail": "Authorization service temporarily unavailable",
-			})
-			return
-		}
-		if perms["iam:manage"] {
-			c.Next()
-			return
-		}
-
-		led, err := m.LedTeamsResolver(c.Request.Context(), userID)
-		if err != nil {
-			slog.Error("Team-lead resolution failed", "user_id", userID, "error", err)
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"detail": "Authorization service temporarily unavailable",
-			})
-			return
-		}
-		if len(led) == 0 {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"detail": "Insufficient permissions: requires iam:manage or team leadership",
 			})
 			return
 		}

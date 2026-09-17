@@ -100,7 +100,7 @@ func GetUserPermissions(ctx context.Context, userID int64) ([]string, map[string
 
 // InvalidateUserPermissions evicts a user's cached permission set, forcing the
 // next GetUserPermissions call to re-resolve from MySQL. Called from every
-// Admin Panel mutation that changes a user's role/team/status (see
+// Admin Panel mutation that changes a user's role/status (see
 // internal/services/admin.go) so the effect is immediate rather than waiting
 // out the TTL — the active-invalidation half of the agreed cache strategy,
 // with the TTL/stale-serving behavior kept as-is for the now-rarer case of a
@@ -285,14 +285,13 @@ func GetOrProvisionUserByExternalSubject(ctx context.Context, sub, sourceIP stri
 	return userID, status, nil
 }
 
-// provisionUserByExternalSubject creates a new user row, assigns it to the
-// MISC default team, and grants READ_ONLY_ANALYST — all in one transaction
-// so a partial provision (a user row with no role, or no team) can never
-// happen. There's no email/display name available at this layer (the
-// frontend only ever sends the WSO2 "sub" via X-User-Subject, not profile
-// claims — see apiClient.js's getAuthHeaders), so both are placeholder-
-// derived from sub itself; a super admin or team lead can rename the user
-// once they know who it actually is.
+// provisionUserByExternalSubject creates a new user row and grants
+// READ_ONLY_ANALYST — both in one transaction so a partial provision (a
+// user row with no role) can never happen. There's no email/display name
+// available at this layer (the frontend only ever sends the WSO2 "sub" via
+// X-User-Subject, not profile claims — see apiClient.js's getAuthHeaders),
+// so both are placeholder-derived from sub itself; a super admin can rename
+// the user once they know who it actually is.
 func provisionUserByExternalSubject(ctx context.Context, sub string) (userID int64, status string, err error) {
 	db, err := getMySQLDB()
 	if err != nil {
@@ -322,31 +321,6 @@ func provisionUserByExternalSubject(ctx context.Context, sub string) (userID int
 		return 0, "", fmt.Errorf("failed to read new user id: %w", err)
 	}
 
-	// Team assignment is best-effort in an environment that hasn't run
-	// 0003_add_teams.sql yet (missing `teams` table, or `users` missing its
-	// `team_id` column) — a JIT-provisioned user still gets created and
-	// granted READ_ONLY_ANALYST below either way. A super admin or team
-	// lead can assign a real team later once that migration runs; this must
-	// never block basic login/provisioning on a table this environment
-	// doesn't have yet.
-	var miscTeamID int64
-	teamLookupErr := tx.QueryRowContext(ctx, "SELECT id FROM teams WHERE is_default = TRUE LIMIT 1").Scan(&miscTeamID)
-	switch {
-	case teamLookupErr == nil:
-		if _, err := tx.ExecContext(ctx, "UPDATE users SET team_id = ? WHERE id = ?", miscTeamID, newID); err != nil {
-			if !isMissingSchemaError(err) {
-				return 0, "", fmt.Errorf("failed to assign default team: %w", err)
-			}
-			metrics.MySQLOptionalTableMissing.WithLabelValues("users.team_id").Set(1)
-			slog.Warn("users.team_id column not present — provisioning user without a team assignment", "external_subject", sub)
-		}
-	case isMissingSchemaError(teamLookupErr):
-		metrics.MySQLOptionalTableMissing.WithLabelValues("teams").Set(1)
-		slog.Warn("teams table not present — provisioning user without a team assignment", "external_subject", sub)
-	default:
-		return 0, "", fmt.Errorf("failed to resolve default team: %w", teamLookupErr)
-	}
-
 	var roleID int64
 	if err := tx.QueryRowContext(ctx, "SELECT id FROM roles WHERE name = 'READ_ONLY_ANALYST'").Scan(&roleID); err != nil {
 		return 0, "", fmt.Errorf("failed to resolve default role: %w", err)
@@ -359,41 +333,6 @@ func provisionUserByExternalSubject(ctx context.Context, sub string) (userID int
 		return 0, "", fmt.Errorf("failed to commit provisioning transaction: %w", err)
 	}
 	return newID, "ACTIVE", nil
-}
-
-// GetLedTeamIDs returns the team IDs a user leads (team_leads rows), or an
-// empty slice if they lead none. Deliberately uncached — unlike
-// GetUserPermissions, this is a single indexed lookup (idx_team_leads_user)
-// and team-lead changes are rare, so a second cache to keep in sync with
-// InvalidateUserPermissions would be complexity with no real payoff.
-func GetLedTeamIDs(ctx context.Context, userID int64) ([]int64, error) {
-	db, err := getMySQLDB()
-	if err != nil {
-		return nil, fmt.Errorf("mysql unavailable: %w", err)
-	}
-	rows, err := db.QueryContext(ctx, "SELECT team_id FROM team_leads WHERE user_id = ?", userID)
-	if err != nil {
-		if isMissingSchemaError(err) {
-			metrics.MySQLOptionalTableMissing.WithLabelValues("team_leads").Set(1)
-			slog.Warn("team_leads table not present in this environment — treating this user as leading no teams", "user_id", userID)
-			return []int64{}, nil
-		}
-		return nil, fmt.Errorf("failed to resolve led teams: %w", err)
-	}
-	defer rows.Close()
-
-	ids := make([]int64, 0)
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan led team id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-	return ids, nil
 }
 
 // RecordAuditEvent inserts one audit_log row. actorUserID is nil for
