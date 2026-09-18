@@ -322,6 +322,27 @@ func ParseFilterNode(node map[string]interface{}) (string, []interface{}) {
 		return combined, allParams
 
 	} else if nodeType == "condition" {
+		op, _ := node["operator"].(string)
+
+		// IS_FINANCIAL_AUA ignores whatever field/value the condition node
+		// carries (VisualFilterBuilder.jsx clears both when this operator is
+		// selected) -- the target column and code list are both fixed here,
+		// not read from the rule. Handled before the normal field validation
+		// below, which would otherwise reject the (deliberately empty) field.
+		if op == "IS_FINANCIAL_AUA" {
+			auaField, err := ValidateIdentifier(TranslateField("_data.aua"))
+			if err != nil {
+				slog.Error("Invalid hardcoded aua field mapping", "error", err)
+				return "", nil
+			}
+			codes := financialAuaCodesAsAny()
+			placeholders := make([]string, len(codes))
+			for i := range placeholders {
+				placeholders[i] = "?"
+			}
+			return fmt.Sprintf("%s IN (%s)", auaField, strings.Join(placeholders, ", ")), codes
+		}
+
 		fieldRaw, _ := node["field"].(string)
 		translated := TranslateField(fieldRaw)
 		field, err := ValidateIdentifier(translated)
@@ -330,7 +351,6 @@ func ParseFilterNode(node map[string]interface{}) (string, []interface{}) {
 			return "", nil
 		}
 
-		op, _ := node["operator"].(string)
 		val := node["value"]
 
 		opMap := map[string]string{
