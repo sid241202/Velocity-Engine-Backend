@@ -217,7 +217,7 @@ var (
 		Help: "Explicit RBAC permission cache invalidations triggered by an Admin Panel role/team/status change.",
 	})
 
-	// BackendConsumeDelay is the last checkpoint of the Kafka-to-Redis
+	// BackendConsumeDelay is the last checkpoint of the Kafka-to-KeyDB
 	// per-stage latency chain (see the observability plan): time from
 	// Flink's producedAt timestamp (TimeUtils.currentIstString() at
 	// emission — see RuleEvaluatorFunction.java) to this backend consuming
