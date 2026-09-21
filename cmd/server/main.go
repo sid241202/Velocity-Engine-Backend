@@ -223,7 +223,12 @@ func main() {
 	router.POST("/rules/:rule_id/prod", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.PublishRule)
 	router.POST("/rules/:rule_id/status", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "publish"), rulesHandler.UpdateRuleStatus)
 	router.PUT("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "update"), rulesHandler.UpdateRule)
-	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), authMW.RequirePermission("rules", "delete"), rulesHandler.DeleteRule)
+	// DELETE deliberately has no RequirePermission here: whether the caller
+	// may delete depends on the rule's status too (rules:delete_draft only
+	// covers a DRAFT rule), which RequirePermission's flat resource:action
+	// check can't express — DeleteRule itself resolves permissions and
+	// enforces this. See that handler's doc comment.
+	router.DELETE("/rules/:rule_id", middleware.IdentityMiddleware(), rulesHandler.DeleteRule)
 	router.GET("/rules/:rule_id/live-results", rulesHandler.LiveResults)
 	// Scalable group browsing for high-cardinality grouping keys — ranks
 	// groups server-side in ClickHouse (top-groups) and fetches one exact

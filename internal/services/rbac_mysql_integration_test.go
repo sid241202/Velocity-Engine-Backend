@@ -46,7 +46,7 @@ func TestMySQLIntegration_SchemaVerificationAndPermissionResolution(t *testing.T
 		t.Fatalf("getMySQLDB failed: %v", err)
 	}
 
-	// Seed data assertions — the four approved roles and ten permissions
+	// Seed data assertions — the four approved roles and eleven permissions
 	// from the migration must be present exactly as designed.
 	var roleCount int
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM roles WHERE is_system = TRUE").Scan(&roleCount); err != nil {
@@ -60,11 +60,11 @@ func TestMySQLIntegration_SchemaVerificationAndPermissionResolution(t *testing.T
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM permissions").Scan(&permCount); err != nil {
 		t.Fatalf("failed to count seeded permissions: %v", err)
 	}
-	if permCount != 10 {
-		t.Fatalf("expected 10 seeded permissions, got %d", permCount)
+	if permCount != 11 {
+		t.Fatalf("expected 11 seeded permissions, got %d", permCount)
 	}
 
-	// SUPER_ADMIN must have all 10 permissions (CROSS JOIN in the seed).
+	// SUPER_ADMIN must have all 11 permissions (CROSS JOIN in the seed).
 	var superAdminPermCount int
 	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM role_permissions rp
@@ -73,11 +73,12 @@ func TestMySQLIntegration_SchemaVerificationAndPermissionResolution(t *testing.T
 	`).Scan(&superAdminPermCount); err != nil {
 		t.Fatalf("failed to count SUPER_ADMIN permissions: %v", err)
 	}
-	if superAdminPermCount != 10 {
-		t.Fatalf("expected SUPER_ADMIN to have all 10 permissions, got %d", superAdminPermCount)
+	if superAdminPermCount != 11 {
+		t.Fatalf("expected SUPER_ADMIN to have all 11 permissions, got %d", superAdminPermCount)
 	}
 
-	// RULE_EDITOR must NOT have rules:publish or rules:delete (maker-checker split).
+	// RULE_EDITOR must NOT have rules:publish or unconditional rules:delete
+	// (maker-checker split) — but must have the narrower rules:delete_draft.
 	var editorHasPublish int
 	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM role_permissions rp
@@ -89,6 +90,19 @@ func TestMySQLIntegration_SchemaVerificationAndPermissionResolution(t *testing.T
 	}
 	if editorHasPublish != 0 {
 		t.Fatalf("expected RULE_EDITOR to have neither rules:publish nor rules:delete, found %d matching grants", editorHasPublish)
+	}
+
+	var editorHasDeleteDraft int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM role_permissions rp
+		JOIN roles r ON r.id = rp.role_id
+		JOIN permissions p ON p.id = rp.permission_id
+		WHERE r.name = 'RULE_EDITOR' AND p.resource = 'rules' AND p.action = 'delete_draft'
+	`).Scan(&editorHasDeleteDraft); err != nil {
+		t.Fatalf("failed to check RULE_EDITOR delete_draft permission: %v", err)
+	}
+	if editorHasDeleteDraft != 1 {
+		t.Fatalf("expected RULE_EDITOR to have rules:delete_draft, found %d matching grants", editorHasDeleteDraft)
 	}
 
 	// End-to-end permission resolution through fetchUserPermissionsFromDB

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"velocity-engine-control-plane-backend-go/internal/middleware"
 	"velocity-engine-control-plane-backend-go/internal/models"
 	"velocity-engine-control-plane-backend-go/internal/services"
 
@@ -350,7 +351,17 @@ func (h *RulesHandler) UpdateRuleStatus(c *gin.Context) {
 	})
 }
 
-// DeleteRule handles DELETE /rules/:rule_id
+// DeleteRule handles DELETE /rules/:rule_id.
+//
+// Unlike every other mutation route, this one is NOT gated by a single
+// RequirePermission at the router (see main.go) — deletion rights depend on
+// both the caller's permissions AND the rule's current status, which
+// RequirePermission's flat resource:action check can't express. Two
+// permissions cover it: rules:delete (unconditional — RULE_MANAGER/
+// SUPER_ADMIN) and rules:delete_draft (RULE_EDITOR — only while the rule is
+// still DRAFT). Resolving the caller's full permission set here mirrors
+// GetRule's sibling handler GET /me (internal/handlers/iam.go), which
+// already calls services.GetUserPermissions directly from a handler.
 func (h *RulesHandler) DeleteRule(c *gin.Context) {
 	ruleID := c.Param("rule_id")
 
@@ -362,6 +373,7 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 		return
 	}
 	wasPublished := record.IsPublished
+	status := record.Status
 
 	var ruleDict map[string]interface{}
 	if err := json.Unmarshal(record.RulePayload, &ruleDict); err != nil {
@@ -370,6 +382,23 @@ func (h *RulesHandler) DeleteRule(c *gin.Context) {
 		return
 	}
 	h.mu.RUnlock()
+
+	userID, ok := c.MustGet(middleware.ContextKeyUserID).(int64)
+	if !ok {
+		slog.Error("auth_user_id in context has unexpected type")
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Internal authorization error"})
+		return
+	}
+	_, perms, err := services.GetUserPermissions(c.Request.Context(), userID)
+	if err != nil {
+		slog.Error("Permission resolution failed", "user_id", userID, "rule_id", ruleID, "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "Authorization service temporarily unavailable"})
+		return
+	}
+	if !perms["rules:delete"] && !(perms["rules:delete_draft"] && status == "DRAFT") {
+		c.JSON(http.StatusForbidden, gin.H{"detail": "Insufficient permissions: rules:delete_draft only allows deleting a rule while it is DRAFT"})
+		return
+	}
 
 	// If it was ever published, tell Flink to delete its state (outside lock)
 	if wasPublished {
