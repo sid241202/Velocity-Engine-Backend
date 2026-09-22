@@ -70,10 +70,10 @@ func (as *AnomalyStore) GetRecent(ruleID string, n int) []map[string]interface{}
 //   - AnomalyStore (in-memory ring buffer)
 //   - AnomalyWSManager (WebSocket push to subscribed clients)
 type AnomalyConsumer struct {
-	cancel        context.CancelFunc
-	done          chan struct{}
-	anomalyStore  *AnomalyStore
-	anomalyWSMgr  *WSManager
+	cancel       context.CancelFunc
+	done         chan struct{}
+	anomalyStore *AnomalyStore
+	anomalyWSMgr *WSManager
 }
 
 func NewAnomalyConsumer(store *AnomalyStore, wm *WSManager) *AnomalyConsumer {

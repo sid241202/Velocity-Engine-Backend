@@ -129,7 +129,6 @@ func (h *AnalysisHandler) AnomalyAnalysis(c *gin.Context) {
 	})
 }
 
-
 func (h *AnalysisHandler) AggAnalysis(c *gin.Context) {
 	ruleIDsParam := c.Query("rule_ids")
 	// URL-decode timestamps: the frontend sends encodeURIComponent("YYYY-MM-DD HH:MM:SS")
