@@ -82,20 +82,21 @@ CREATE TABLE audit_log (
     CONSTRAINT fk_audit_log_actor FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ── Seed data: the four approved roles and ten permissions ─────────────────
+-- ── Seed data: the four approved roles and eleven permissions ──────────────
 
 INSERT INTO roles (name, description, is_system) VALUES
     ('SUPER_ADMIN',       'Full system access, including user and role administration.', TRUE),
     ('RULE_MANAGER',      'Full rule lifecycle (create/edit/publish/delete) and full analysis read access.', TRUE),
-    ('RULE_EDITOR',       'Can draft and edit rules but cannot publish or delete them.', TRUE),
+    ('RULE_EDITOR',       'Can draft, edit, and delete DRAFT rules; cannot publish a rule or touch one that has ever been published.', TRUE),
     ('READ_ONLY_ANALYST', 'Read-only access to all analysis views; no rule mutation rights.', TRUE);
 
 INSERT INTO permissions (resource, action, description) VALUES
-    ('rules', 'create',  'Create a new rule (draft).'),
-    ('rules', 'read',    'View rule definitions.'),
-    ('rules', 'update',  'Edit an existing rule.'),
-    ('rules', 'delete',  'Delete a rule.'),
-    ('rules', 'publish', 'Publish a rule to ACTIVE / change its production status.'),
+    ('rules', 'create',       'Create a new rule (draft).'),
+    ('rules', 'read',         'View rule definitions.'),
+    ('rules', 'update',       'Edit an existing rule.'),
+    ('rules', 'delete',       'Delete a rule, regardless of its status.'),
+    ('rules', 'delete_draft', 'Delete a rule only while it is still in DRAFT status — narrower than rules:delete, which this does not imply.'),
+    ('rules', 'publish',      'Publish a rule to ACTIVE / change its production status.'),
     ('live_analysis', 'read', 'View the Live Analysis panel.'),
     ('aggregated_analysis', 'read', 'View the Analytics panel (ClickHouse-backed).'),
     ('historical_analysis', 'read', 'View historical replay results.'),
@@ -107,12 +108,12 @@ SELECT r.id, p.id FROM roles r CROSS JOIN permissions p WHERE r.name = 'SUPER_AD
 
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT r.id, p.id FROM roles r JOIN permissions p
-WHERE r.name = 'RULE_MANAGER' AND p.resource <> 'iam';
+WHERE r.name = 'RULE_MANAGER' AND p.resource <> 'iam' AND NOT (p.resource = 'rules' AND p.action = 'delete_draft');
 
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT r.id, p.id FROM roles r JOIN permissions p
 WHERE r.name = 'RULE_EDITOR' AND (
-    (p.resource = 'rules' AND p.action IN ('create','read','update'))
+    (p.resource = 'rules' AND p.action IN ('create','read','update','delete_draft'))
     OR p.resource IN ('live_analysis','aggregated_analysis','historical_analysis')
 );
 

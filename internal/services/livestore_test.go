@@ -48,7 +48,7 @@ func TestLiveStore_UpsertReplacesInPlace(t *testing.T) {
 func TestLiveStore_DistinctWindowsAndGroupsAppend(t *testing.T) {
 	s := &LiveStore{data: map[string][]map[string]interface{}{}, index: map[string]map[string]int{}, maxRows: 1000, hours: 24}
 	s.Add(row("R1", "g1", nowIST(0), 1, true))
-	s.Add(row("R1", "g2", nowIST(0), 1, true)) // different groupKey
+	s.Add(row("R1", "g2", nowIST(0), 1, true))  // different groupKey
 	s.Add(row("R1", "g1", nowIST(-1), 1, true)) // different windowStart
 	if s.totalRows != 3 {
 		t.Fatalf("expected 3 distinct rows, got %d", s.totalRows)

@@ -37,9 +37,9 @@ type FilterNode struct {
 
 // GroupingConfig matches Flink GroupingConfig model exactly.
 type GroupingConfig struct {
-	Keys              []string `json:"keys"`
-	EntityName        string   `json:"entity_name,omitempty"`
-	AnomalyEntityField string  `json:"anomaly_entity_field,omitempty"`
+	Keys               []string `json:"keys"`
+	EntityName         string   `json:"entity_name,omitempty"`
+	AnomalyEntityField string   `json:"anomaly_entity_field,omitempty"`
 }
 
 // SinkConfig controls which downstream sinks are active for a rule.
@@ -79,7 +79,7 @@ type HavingThresholds struct {
 // VelocityRule is the top-level rule structure.
 // Matches Flink VelocityRule model exactly.
 type VelocityRule struct {
-	RuleMetadata     RuleMetadata     `json:"rule_metadata"`
+	RuleMetadata     RuleMetadata      `json:"rule_metadata"`
 	ExecutionRouting ExecutionRouting  `json:"execution_routing"`
 	Filters          *FilterNode       `json:"filters"`
 	Grouping         GroupingConfig    `json:"grouping"`
@@ -87,7 +87,7 @@ type VelocityRule struct {
 	Aggregations     []AggregationSpec `json:"aggregations"`
 	HavingThresholds HavingThresholds  `json:"having_thresholds"`
 	// Sinks controls which downstream sinks are active. Passed through to Flink.
-	Sinks            *SinkConfig       `json:"sinks,omitempty"`
+	Sinks *SinkConfig `json:"sinks,omitempty"`
 }
 
 // RuleRecord is the in-memory storage record for a rule.

@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	producer    *kafka.Producer
-	producerMu  sync.Mutex
+	producer   *kafka.Producer
+	producerMu sync.Mutex
 )
 
 // getProducer returns the singleton Kafka producer, creating it if necessary.

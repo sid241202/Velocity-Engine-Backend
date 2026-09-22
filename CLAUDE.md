@@ -75,7 +75,23 @@ reading it is worse than no env var at all.
   (`PUT /rules/:rule_id`), `rules:publish` (`POST /rules/:rule_id/prod` and
   `POST /rules/:rule_id/status` — status-change is gated on the same key as
   publish because it can also set a rule to `ACTIVE` via the identical
-  `services.PublishRule` path), `rules:delete` (`DELETE /rules/:rule_id`).
+  `services.PublishRule` path).
+  `DELETE /rules/:rule_id` is the one exception to the "single
+  `RequirePermission` at the route" pattern (added 2026-09-22): whether a
+  caller may delete depends on the rule's current status too, which a flat
+  resource:action check can't express. `rules:delete` (RULE_MANAGER/
+  SUPER_ADMIN) is unconditional; the narrower `rules:delete_draft`
+  (RULE_EDITOR) only covers a rule still in `DRAFT`. The route carries no
+  `RequirePermission` at all — `DeleteRule` (`internal/handlers/rules.go`)
+  resolves the caller's full permission set itself via
+  `services.GetUserPermissions` (same pattern `GET /me` in
+  `internal/handlers/iam.go` already uses) and enforces
+  `rules:delete OR (rules:delete_draft AND status == DRAFT)` inline.
+  Editing (`rules:update`/`PUT /rules/:rule_id`) was deliberately left
+  unconditional on role — a RULE_EDITOR can edit any rule currently in
+  `DRAFT`/`PAUSED` status regardless of whether it was ever published,
+  including one a RULE_MANAGER paused back from `ACTIVE`; only delete got
+  the draft-only restriction, per explicit 2026-09-22 instruction.
   The read-only routes (`GET /rules`, `GET /rules/:rule_id`, live-results)
   remain intentionally unguarded — a separate, not-yet-made policy decision.
 

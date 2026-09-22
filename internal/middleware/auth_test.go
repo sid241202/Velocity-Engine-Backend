@@ -215,4 +215,3 @@ func TestIdentityMiddleware_PassesSourceIPToResolver(t *testing.T) {
 		t.Fatalf("expected resolver to receive the request's source IP, got %q", gotIP)
 	}
 }
-

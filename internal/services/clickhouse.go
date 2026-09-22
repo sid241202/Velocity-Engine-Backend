@@ -65,8 +65,14 @@ func getClickHouseDB() (*sql.DB, error) {
 		DialTimeout: 10 * time.Second,
 		ReadTimeout: 120 * time.Second, // Increased from 30s — heavy agg scans over 24h can take >30s
 	})
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	// Bumped 10/5 -> 20/10 per FINAL_DEMO_SPECS.txt section 3.6, to match
+	// the MySQL pool's already-established pattern (config.go): with the
+	// backend pinned to a single pod for this rollout phase, this pool is
+	// the only ClickHouse concurrency available system-wide (no fan-out
+	// across replicas), and a synchronized burst of concurrent analysts
+	// hitting Live/Aggregated Analysis could otherwise queue at 10.
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetConnMaxIdleTime(2 * time.Minute) // proactively recycle idle conns before server kills them
 
