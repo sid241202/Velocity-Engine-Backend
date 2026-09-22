@@ -17,13 +17,18 @@ import (
 // queued before Broadcast/WriteToConn start dropping messages for it
 // instead of blocking the caller. Broadcast's caller is the Kafka consumer
 // goroutine, so a slow/stalled client must never be able to stall message
-// consumption for every other subscriber. Sized generously (not the
-// original 64) for real production event volume, where a single window
-// close on a high-cardinality grouping key can legitimately enqueue many
-// result rows in a single burst — this is headroom against that burst
+// consumption for every other subscriber. Sized generously (up from an
+// original 64, then 256) for real production event volume, where a single
+// window close on a high-cardinality grouping key can legitimately enqueue
+// many result rows in a single burst — this is headroom against that burst
 // depth, not a fix for a genuinely slow consumer (which ErrOutboxFull
 // still correctly detects and drops for, just at a higher threshold).
-const outboxSize = 256
+// Bumped 256 -> 4096 per FINAL_DEMO_SPECS.txt section 3.7: worst-case
+// combined RESULTS+ANOMALIES volume at ~24 rules is modeled at up to
+// ~11,000 msgs/sec system-wide, and a connection subscribed to several
+// busy rules could see traffic well above what 256 slots absorb for more
+// than a fraction of a second before dropping.
+const outboxSize = 4096
 
 // writeDeadline bounds how long a single WriteMessage call may block on the
 // network once the writer goroutine picks a message off the outbox — a
