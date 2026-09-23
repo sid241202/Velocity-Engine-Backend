@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"os"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
@@ -21,6 +20,10 @@ type ResultsConsumer struct {
 	done      chan struct{}
 	liveStore *LiveStore
 	wsManager *WSManager
+	// pool drains raw message bytes off the read loop. See workerPool's doc
+	// comment in msgpool.go for why the read loop no longer processes
+	// messages itself.
+	pool *workerPool
 }
 
 // NewResultsConsumer creates a new results consumer.
@@ -32,11 +35,18 @@ func NewResultsConsumer(ls *LiveStore, wm *WSManager) *ResultsConsumer {
 func (rc *ResultsConsumer) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	rc.cancel = cancel
+	rc.pool = newWorkerPool(config.ResultsTopic, config.ConsumerWorkers, config.ConsumerQueueSize, rc.processMessage)
 	go func() {
 		defer close(rc.done)
 		rc.run(ctx)
+		// Drain whatever is still queued before declaring the consumer
+		// stopped — the read loop has exited by now, so nothing else can
+		// submit.
+		rc.pool.stop()
 	}()
-	slog.Info("Results consumer started", "topic", config.ResultsTopic)
+	slog.Info("Results consumer started",
+		"topic", config.ResultsTopic,
+		"workers", len(rc.pool.queues))
 }
 
 // stopWait bounds how long Stop blocks for the consumer goroutine to
@@ -72,24 +82,29 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 		default:
 		}
 
-		// Use POD_NAME (set by Kubernetes downward API) for a stable group ID per pod.
-		// This prevents stale consumer group accumulation on restarts.
-		// Fallback to hostname for non-Kubernetes environments.
-		podName := os.Getenv("POD_NAME")
-		if podName == "" {
-			hostname, _ := os.Hostname()
-			podName = hostname
-			slog.Warn("POD_NAME env var not set — using hostname for consumer group ID; set downward API in k8s deployment")
-		}
-		groupID := config.ResultsConsumerGroup + "-" + podName
+		// One shared group ID for the topic — deliberately NOT suffixed with
+		// the pod name. The old per-pod suffix put every pod in its own
+		// consumer group, so each pod would receive a full copy of every
+		// partition instead of sharing the topic between them: at 2 pods,
+		// twice the ingest work and twice the WebSocket fan-out, with both
+		// pods holding the same rows. That is a landmine rather than a bug
+		// today (replicas: 1), but it costs nothing to remove now, and it
+		// would be an unpleasant surprise the first time anyone scaled the
+		// deployment up. Group membership is identified by Kafka's own
+		// member id, so restarts do not accumulate stale groups.
+		groupID := config.ResultsConsumerGroup
 
-		c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		cfg := &kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,
 			"group.id":           groupID,
 			"auto.offset.reset":  "latest",
 			"enable.auto.commit": true,
 			"session.timeout.ms": 30000,
-		})
+		}
+		for k, v := range kafkaTuning() {
+			cfg.SetKey(k, v)
+		}
+		c, err := kafka.NewConsumer(cfg)
 		if err != nil {
 			slog.Error("Failed to create Kafka results consumer — will retry", "error", err, "backoff", backoff)
 			select {
@@ -147,7 +162,12 @@ func (rc *ResultsConsumer) run(ctx context.Context) {
 				metrics.KafkaConsumerLag.WithLabelValues(config.ResultsTopic, config.ResultsConsumerGroup).Set(float64(lag))
 			}
 
-			rc.processMessage(msg.Value)
+			// Hand off to the worker pool, keyed by the record key so all
+			// updates for one key stay ordered on one worker.
+			if !rc.pool.submit(ctx, msg.Key, msg.Value) {
+				c.Close()
+				return // context cancelled while waiting for queue space
+			}
 		}
 		c.Close()
 	}

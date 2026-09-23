@@ -2,14 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"velocity-engine-control-plane-backend-go/internal/config"
-	"velocity-engine-control-plane-backend-go/internal/metrics"
 	"velocity-engine-control-plane-backend-go/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -70,45 +68,23 @@ func (h *WSHandler) LiveAnalysisWS(c *gin.Context) {
 
 	slog.Info("WebSocket live-analysis connected")
 
-	heartbeatInterval := time.Duration(h.wsManager.HeartbeatInterval()) * time.Second
+	extendDeadline := startReadLiveness(conn)
 
 	for {
-		// Set read deadline for heartbeat timeout
-		conn.SetReadDeadline(time.Now().Add(heartbeatInterval))
-
 		_, message, err := conn.ReadMessage()
 		if err != nil {
+			// Every read error is terminal for this connection — see
+			// startReadLiveness. Never loop back into ReadMessage here.
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				slog.Info("WebSocket live-analysis disconnected normally")
-				return
+			} else if closeErr, ok := err.(*websocket.CloseError); ok {
+				slog.Info("WebSocket closed", "code", closeErr.Code)
+			} else {
+				slog.Info("WebSocket live-analysis read ended", "error", err)
 			}
-			// Check if it's a timeout (which means we should send heartbeat)
-			if netErr, ok := err.(*websocket.CloseError); ok {
-				slog.Info("WebSocket closed", "code", netErr.Code)
-				return
-			}
-			// Timeout — send heartbeat
-			if isTimeout(err) {
-				heartbeatMsg, _ := json.Marshal(map[string]string{"type": "heartbeat"})
-				if writeErr := h.wsManager.WriteToConn(conn, websocket.TextMessage, heartbeatMsg); writeErr != nil {
-					if errors.Is(writeErr, services.ErrOutboxFull) {
-						// The outbox is full of real data, not evidence of a
-						// dead connection — real broadcasts already prove
-						// this client is alive and being served. Skip this
-						// heartbeat tick rather than disconnecting a
-						// perfectly healthy, busy connection.
-						metrics.WebSocketHeartbeatSkippedTotal.WithLabelValues("live").Inc()
-						slog.Warn("Heartbeat skipped — outbox full of real data, connection stays open", "stream", "live")
-						continue
-					}
-					slog.Error("Failed to send heartbeat", "error", writeErr)
-					return
-				}
-				continue
-			}
-			slog.Error("WebSocket read error", "error", err)
 			return
 		}
+		extendDeadline()
 
 		// Parse the message
 		var msg map[string]interface{}
@@ -142,19 +118,43 @@ func (h *WSHandler) LiveAnalysisWS(c *gin.Context) {
 	}
 }
 
-// isTimeout checks if an error is a timeout error.
-func isTimeout(err error) bool {
-	if err == nil {
-		return false
+// startReadLiveness configures a connection's read side for ping/pong
+// liveness and returns a function that pushes the read deadline forward.
+//
+// This replaces a read loop that treated a read timeout as "send an
+// application-level heartbeat and keep reading". That could not work:
+// gorilla/websocket treats ANY read error, a deadline timeout included, as
+// terminal for the connection's read side — every subsequent ReadMessage
+// returns the same cached error immediately instead of blocking. The loop
+// therefore spun at full CPU sending heartbeats until gorilla's own
+// repeated-read guard fired ("repeated read on failed websocket
+// connection") and panicked the handler, killing the connection. In
+// practice that meant every Live Stream socket died roughly 30 seconds
+// after the client's last inbound message — the client has nothing to send
+// after its initial subscribe — and then reconnected, which is a large part
+// of the disconnects seen in the logs.
+//
+// Liveness now uses the protocol's own mechanism: WSManager's writePump
+// sends a ping frame every WS_HEARTBEAT_INTERVAL, the client's WebSocket
+// stack answers with a pong automatically (browsers do this with no
+// application code), and each pong extends the read deadline. A read
+// timeout now means what it should — nothing came back for two whole
+// intervals — and the connection is closed rather than spun on.
+func startReadLiveness(conn *websocket.Conn) func() {
+	interval := time.Duration(config.WSHeartbeatSec) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
-	// net.Error with Timeout() is the standard way
-	type timeoutError interface {
-		Timeout() bool
-	}
-	if te, ok := err.(timeoutError); ok {
-		return te.Timeout()
-	}
-	return false
+	// Two intervals of slack, so a single dropped or delayed pong doesn't
+	// tear down a healthy connection.
+	wait := 2 * interval
+	extend := func() { conn.SetReadDeadline(time.Now().Add(wait)) }
+	extend()
+	conn.SetPongHandler(func(string) error {
+		extend()
+		return nil
+	})
+	return extend
 }
 
 // AnomalyAnalysisWS handles WS /ws/anomaly-analysis
@@ -173,32 +173,19 @@ func (h *WSHandler) AnomalyAnalysisWS(c *gin.Context) {
 
 	slog.Info("WebSocket anomaly-analysis connected")
 
-	heartbeatInterval := time.Duration(h.anomalyWSMgr.HeartbeatInterval()) * time.Second
+	extendDeadline := startReadLiveness(conn)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(heartbeatInterval))
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				slog.Info("AnomalyAnalysisWS disconnected normally")
-				return
+			} else {
+				slog.Info("AnomalyAnalysisWS read ended", "error", err)
 			}
-			if isTimeout(err) {
-				heartbeatMsg, _ := json.Marshal(map[string]string{"type": "heartbeat"})
-				if writeErr := h.anomalyWSMgr.WriteToConn(conn, websocket.TextMessage, heartbeatMsg); writeErr != nil {
-					if errors.Is(writeErr, services.ErrOutboxFull) {
-						metrics.WebSocketHeartbeatSkippedTotal.WithLabelValues("anomaly").Inc()
-						slog.Warn("Heartbeat skipped — outbox full of real data, connection stays open", "stream", "anomaly")
-						continue
-					}
-					slog.Error("AnomalyAnalysisWS heartbeat failed", "error", writeErr)
-					return
-				}
-				continue
-			}
-			slog.Error("AnomalyAnalysisWS read error", "error", err)
 			return
 		}
+		extendDeadline()
 
 		var msg map[string]interface{}
 		if err := json.Unmarshal(message, &msg); err != nil {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -74,6 +73,9 @@ type AnomalyConsumer struct {
 	done         chan struct{}
 	anomalyStore *AnomalyStore
 	anomalyWSMgr *WSManager
+	// pool drains raw message bytes off the read loop — same decoupling as
+	// ResultsConsumer, see workerPool in msgpool.go.
+	pool *workerPool
 }
 
 func NewAnomalyConsumer(store *AnomalyStore, wm *WSManager) *AnomalyConsumer {
@@ -83,11 +85,15 @@ func NewAnomalyConsumer(store *AnomalyStore, wm *WSManager) *AnomalyConsumer {
 func (ac *AnomalyConsumer) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	ac.cancel = cancel
+	ac.pool = newWorkerPool(config.AnomalyTopic, config.ConsumerWorkers, config.ConsumerQueueSize, ac.processAnomaly)
 	go func() {
 		defer close(ac.done)
 		ac.run(ctx)
+		ac.pool.stop()
 	}()
-	slog.Info("Anomaly consumer started", "topic", config.AnomalyTopic)
+	slog.Info("Anomaly consumer started",
+		"topic", config.AnomalyTopic,
+		"workers", len(ac.pool.queues))
 }
 
 // Stop signals the consumer goroutine to stop and waits (bounded by
@@ -115,23 +121,22 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 		default:
 		}
 
-		// Use POD_NAME (set by Kubernetes downward API) for a stable group ID per pod.
-		// This prevents stale consumer group accumulation on restarts.
-		podName := os.Getenv("POD_NAME")
-		if podName == "" {
-			hostname, _ := os.Hostname()
-			podName = hostname
-			slog.Warn("POD_NAME env var not set — using hostname for anomaly consumer group ID")
-		}
-		groupID := config.AnomalyConsumerGroup + "-" + podName
+		// Shared group ID per topic, not per pod — see the equivalent
+		// comment in consumer.go's run() for why the pod-name suffix was
+		// removed.
+		groupID := config.AnomalyConsumerGroup
 
-		c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		cfg := &kafka.ConfigMap{
 			"bootstrap.servers":  config.KafkaBrokers,
 			"group.id":           groupID,
 			"auto.offset.reset":  "latest",
 			"enable.auto.commit": true,
 			"session.timeout.ms": 30000,
-		})
+		}
+		for k, v := range kafkaTuning() {
+			cfg.SetKey(k, v)
+		}
+		c, err := kafka.NewConsumer(cfg)
 		if err != nil {
 			slog.Error("Failed to create anomaly Kafka consumer", "error", err)
 			select {
@@ -185,7 +190,10 @@ func (ac *AnomalyConsumer) run(ctx context.Context) {
 				metrics.KafkaConsumerLag.WithLabelValues(config.AnomalyTopic, config.AnomalyConsumerGroup).Set(float64(lag))
 			}
 
-			ac.processAnomaly(msg.Value)
+			if !ac.pool.submit(ctx, msg.Key, msg.Value) {
+				c.Close()
+				return // context cancelled while waiting for queue space
+			}
 		}
 		c.Close()
 	}

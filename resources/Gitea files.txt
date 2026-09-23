@@ -22,9 +22,38 @@ data:
   CLICKHOUSE_TABLE: "auth_velocity_agg_results"
   ICEBERG_S3_PATH: "s3://prd-bi-data-platform-auth/stream_auth.db/auth_raw_union_v1"
   S3_ENDPOINT: "http://10.10.103.12:425"
-  LIVE_STORE_MAX_ROWS: "750000"
+  # LIVE_STORE_MAX_ROWS is NO LONGER READ — replaced by
+  # LIVE_STORE_MAX_ROWS_PER_RULE below. The old key was one budget shared by
+  # every rule, and trimming evicted from whichever rule held the most rows,
+  # so a busy rule's traffic could silently shrink or empty a different,
+  # quiet rule's live snapshot — the backend half of the "live chart flashes
+  # to a different/smaller graph" bug. Eviction is now strictly per rule.
+  # Note the value below is PER RULE: reusing 750000 here would mean 750000
+  # rows for every rule, not 750000 in total.
+  LIVE_STORE_MAX_ROWS_PER_RULE: "25000"
   LIVE_STORE_HOURS: "1"
   WS_HEARTBEAT_INTERVAL: "30"
+  # ── Ingest concurrency ──────────────────────────────────────────────────
+  # The Kafka read loop hands raw messages to a worker pool instead of
+  # unmarshalling, storing and fanning out inline on the single goroutine
+  # that owns the Kafka client. CONSUMER_WORKERS "0" means GOMAXPROCS, which
+  # tracks the pod's CPU limit (4) — the point of the change is to actually
+  # use the cores this pod already requests, so pin it only to diagnose.
+  CONSUMER_WORKERS: "0"
+  CONSUMER_QUEUE_SIZE: "16384"
+  KAFKA_FETCH_MIN_BYTES: "65536"
+  KAFKA_FETCH_WAIT_MAX_MS: "100"
+  KAFKA_QUEUED_MAX_MESSAGES_KB: "65536"
+  # ── WebSocket fan-out ───────────────────────────────────────────────────
+  # Updates are coalesced per rule and flushed as ONE consolidated message
+  # per interval instead of one frame per Kafka message. 250ms deliberately
+  # matches the frontend's own delta-flush window in LiveAnalysis.jsx —
+  # pushing faster than the browser re-renders only produces dropped
+  # messages and visible stutter.
+  WS_BROADCAST_INTERVAL_MS: "250"
+  WS_BROADCAST_MAX_BATCH_ROWS: "5000"
+  WS_OUTBOX_SIZE: "4096"
+  WS_WRITE_DEADLINE_SECONDS: "10"
   MYSQL_HOST: "10.10.106.159"
   MYSQL_PORT: "3306"
   MYSQL_USER: "velocity_W"

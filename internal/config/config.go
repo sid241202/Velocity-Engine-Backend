@@ -42,7 +42,23 @@ var (
 	IcebergS3Path = getEnv("ICEBERG_S3_PATH", "s3://warehouse/stream_auth.db/auth_txn_raw_union_v1")
 
 	// LiveStore
-	LiveStoreMaxRows = getEnvInt("LIVE_STORE_MAX_ROWS", 50000)
+	// LiveStoreMaxRowsPerRule caps rows held for ONE rule. It replaces the
+	// former global LIVE_STORE_MAX_ROWS cap, which was shared across every
+	// rule and evicted from whichever rule happened to hold the most rows —
+	// so a single busy rule's traffic could shrink or empty a completely
+	// different rule's snapshot, which is exactly what made the frontend's
+	// live chart appear to "flash to a different graph" on reconnect (the
+	// bootstrap it got back no longer matched what it had a moment before).
+	// Eviction is now strictly per rule: exceeding this cap can only ever
+	// drop that same rule's own oldest rows. Total store size is therefore
+	// bounded by (number of active rules x this value), with the
+	// LIVE_STORE_HOURS time prune keeping it far below that in practice.
+	//
+	// NOTE for operators: LIVE_STORE_MAX_ROWS is no longer read. Its old
+	// production value (750000) was a whole-store budget; setting that same
+	// number here would mean 750000 rows *per rule*. Size this against a
+	// single rule's peak window instead — see resources/Gitea files.txt.
+	LiveStoreMaxRowsPerRule = getEnvInt("LIVE_STORE_MAX_ROWS_PER_RULE", 25000)
 	// LiveStoreHours bounds both the startup bootstrap-from-ClickHouse pull
 	// (main.go) and the ongoing background pruning in
 	// internal/services/livestore.go's pruneStale — it is the actual,
@@ -55,6 +71,59 @@ var (
 	// window.
 	LiveStoreHours = getEnvInt("LIVE_STORE_HOURS", 1)
 	WSHeartbeatSec = getEnvInt("WS_HEARTBEAT_INTERVAL", 30)
+
+	// ── Kafka consumer concurrency ───────────────────────────────────────
+	// The results/anomaly consumers used to read a message and process it
+	// (JSON unmarshal + LiveStore write + WebSocket fan-out) inline on the
+	// single goroutine that owns the Kafka client, so end-to-end throughput
+	// was capped at one core no matter how many the pod was given. The read
+	// loop now only hands raw message bytes to a bounded queue drained by a
+	// worker pool.
+	//
+	// ConsumerWorkers: pool size. 0 (the default) means runtime.GOMAXPROCS,
+	// i.e. the pod's CPU limit. Dispatch is key-affine (see
+	// consumer.go's workerFor), so per-key ordering survives the pool.
+	ConsumerWorkers = getEnvInt("CONSUMER_WORKERS", 0)
+	// ConsumerQueueSize: depth of the hand-off queue per consumer. This is
+	// the burst absorber between Kafka reads and processing. When it fills,
+	// the read loop blocks rather than dropping messages — backpressure
+	// surfaces as consumer lag (kafka_consumer_lag), which is visible and
+	// recoverable, instead of as silent data loss.
+	ConsumerQueueSize = getEnvInt("CONSUMER_QUEUE_SIZE", 16384)
+	// KafkaFetchMinBytes / KafkaFetchWaitMaxMs tune librdkafka's fetch
+	// batching. The defaults (1 byte / 500ms) make the broker answer almost
+	// every fetch immediately with whatever is available, which at ~1,000+
+	// msg/sec means a very high fetch rate for small payloads. Waiting for a
+	// modest batch trades a few ms of latency for markedly less syscall and
+	// broker overhead.
+	KafkaFetchMinBytes  = getEnvInt("KAFKA_FETCH_MIN_BYTES", 65536)
+	KafkaFetchWaitMaxMs = getEnvInt("KAFKA_FETCH_WAIT_MAX_MS", 100)
+	// KafkaQueuedMaxMessagesKb bounds librdkafka's own internal prefetch
+	// buffer (per partition), in kilobytes.
+	KafkaQueuedMaxMessagesKb = getEnvInt("KAFKA_QUEUED_MAX_MESSAGES_KB", 65536)
+
+	// ── WebSocket fan-out ────────────────────────────────────────────────
+	// WSBroadcastIntervalMs: how often accumulated per-rule updates are
+	// flushed to subscribers as ONE consolidated message, instead of one
+	// WebSocket frame (and one json.Marshal, and one full scan of every
+	// connection) per Kafka message. Deliberately mirrors the frontend's own
+	// 250ms delta-flush window in src/components/LiveAnalysis.jsx so both
+	// sides coalesce on the same cadence — sending faster than the client
+	// re-renders only buys dropped messages and stutter.
+	WSBroadcastIntervalMs = getEnvInt("WS_BROADCAST_INTERVAL_MS", 250)
+	// WSBroadcastMaxBatchRows bounds how many rows one rule's pending batch
+	// may hold between flushes. Updates coalesce by (groupKey, windowStart)
+	// first, so this is only reached by genuinely distinct rows.
+	WSBroadcastMaxBatchRows = getEnvInt("WS_BROADCAST_MAX_BATCH_ROWS", 5000)
+	// WSOutboxSize: per-connection pending-message queue depth. Was a
+	// hardcoded 4096 in wsmanager.go. Batching means one slot now carries a
+	// whole flush window's worth of rows rather than a single row, so this
+	// buys far more real headroom than the same number did before.
+	WSOutboxSize = getEnvInt("WS_OUTBOX_SIZE", 4096)
+	// WSWriteDeadlineSec: how long a single socket write may block before
+	// the connection is considered stalled and torn down. Was hardcoded at
+	// 10s in wsmanager.go.
+	WSWriteDeadlineSec = getEnvInt("WS_WRITE_DEADLINE_SECONDS", 10)
 
 	// MySQL (RBAC store)
 	MySQLHost         = getEnv("MYSQL_HOST", "localhost")

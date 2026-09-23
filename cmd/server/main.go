@@ -273,9 +273,14 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Stop consumers
+	// Stop consumers. Each Stop now also drains its worker pool, so every
+	// message already read off Kafka is fully applied to the LiveStore and
+	// handed to the WebSocket batcher before shutdown continues.
 	consumer.Stop()
 	anomalyConsumer.Stop()
+
+	// Nothing more will be written to the store; stop its background pruner.
+	liveStore.StopPruner()
 
 	// Shutdown HTTP server
 	if err := srv.Shutdown(ctx); err != nil {

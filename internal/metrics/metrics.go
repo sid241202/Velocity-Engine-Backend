@@ -222,6 +222,23 @@ var (
 	// Flink's producedAt timestamp (TimeUtils.currentIstString() at
 	// emission — see RuleEvaluatorFunction.java) to this backend consuming
 	// the message. topic is exactly 2 values (results, anomalies).
+	// KafkaConsumerQueueDepth / KafkaConsumerQueueFullTotal observe the
+	// hand-off between the Kafka read loop and the processing worker pool
+	// (see internal/services/consumer.go). Depth persistently near capacity,
+	// or a rising queue-full rate, means processing is not keeping up with
+	// ingest — the signal to raise CONSUMER_WORKERS or the pod's CPU limit.
+	// A queue-full event is backpressure, not data loss: the read loop
+	// blocks, so it shows up as consumer lag rather than dropped messages.
+	KafkaConsumerQueueDepth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kafka_consumer_queue_depth",
+		Help: "Messages currently queued between the Kafka read loop and the processing worker pool, by topic.",
+	}, []string{"topic"})
+
+	KafkaConsumerQueueFullTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kafka_consumer_queue_full_total",
+		Help: "Times the Kafka read loop had to block because the processing queue was full, by topic.",
+	}, []string{"topic"})
+
 	BackendConsumeDelay = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "velocity_backend_consume_delay_seconds",
 		Help:    "Time from Flink's producedAt timestamp to this backend consuming the Kafka message, by topic.",
@@ -244,6 +261,7 @@ func init() {
 		IAMJITProvisionedUsersTotal, IAMJITProvisionRateLimitedTotal,
 		IAMAdminMutationsTotal, RBACCacheInvalidationsTotal,
 		BackendConsumeDelay,
+		KafkaConsumerQueueDepth, KafkaConsumerQueueFullTotal,
 	)
 }
 
