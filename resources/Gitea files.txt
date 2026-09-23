@@ -1,0 +1,255 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velocity-backend-go-config
+  namespace: strot-applications
+data:
+  SERVER_HOST: "0.0.0.0"
+  SERVER_PORT: "8000"
+  LOG_LEVEL: "INFO"
+  CORS_ORIGINS: "*"
+  ENV: "prod"
+  KAFKA_BROKERS: "10.10.107.160:9092,10.10.107.95:9092,10.10.107.151:9092,10.10.106.116:9092,10.10.105.220:9092"
+  RULES_TOPIC: "DE.AUTH.VELOCITY_ENGINE.RULES"
+  RESULTS_TOPIC: "DE.AUTH.VELOCITY_ENGINE.RESULTS"
+  RESULTS_CONSUMER_GROUP: "STROT.APPLICATIONS.VELOCITY_ENGINE_BACKEND_RESULTS_CONSUMER"
+  ANOMALY_TOPIC: "DE.AUTH.VELOCITY_ENGINE.ANOMALIES"
+  ANOMALY_CONSUMER_GROUP: "STROT.APPLICATIONS.VELOCITY_ENGINE_BACKEND_ANOMALIES_CONSUMER"
+  CLICKHOUSE_HOST: "10.10.120.85"
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: "default"
+  CLICKHOUSE_DB: "auth_analytics"
+  CLICKHOUSE_TABLE: "auth_velocity_agg_results"
+  ICEBERG_S3_PATH: "s3://prd-bi-data-platform-auth/stream_auth.db/auth_raw_union_v1"
+  S3_ENDPOINT: "http://10.10.103.12:425"
+  LIVE_STORE_MAX_ROWS: "750000"
+  LIVE_STORE_HOURS: "1"
+  WS_HEARTBEAT_INTERVAL: "30"
+  MYSQL_HOST: "10.10.106.159"
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "velocity_W"
+  MYSQL_DATABASE: "project_velocity"
+  # Left at the coded defaults (20/10) deliberately: MySQL pool usage scales
+  # with concurrent dashboard users, not event throughput (per the framing
+  # above), and RBAC permission lookups are cache-fronted
+  # (RBAC_PERMISSION_CACHE_TTL_SECONDS=300 below) so MySQL is only hit on a
+  # cache miss/refresh, not per-request. A small government-tool analyst
+  # headcount doesn't warrant scaling this off the 8-crore/day number —
+  # doing so would be sizing the wrong dimension.
+  MYSQL_MAX_OPEN_CONNS: "20"
+  MYSQL_MAX_IDLE_CONNS: "10"
+  # MYSQL_PASSWORD lives in the Secret below, not here.
+
+  # ── RBAC cache tuning ───────────────────────────────────────────────────
+  RBAC_PERMISSION_CACHE_TTL_SECONDS: "300"
+  RBAC_PERMISSION_MAX_STALE_SECONDS: "1800"
+
+  # ── WSO2 / OIDC ─────────────────────────────────────────────────────────
+  # WSO2_JWKS_URI / WSO2_ISSUER / WSO2_AUDIENCE / JWT_CLOCK_SKEW_SECONDS
+  # REMOVED (2026-09-04): the backend no longer performs JWKS-based signature
+  # verification — internal/config/config.go no longer reads these, and
+  # internal/services/jwtvalidator.go was deleted. Root cause: the
+  # velocity-backend-go pod could not reach https://sso.uidai.net.in/oauth2/jwks
+  # from its pod network in this cluster (TLS handshake timeout, then EOF —
+  # confirmed in prod logs), so every request 401'd with "could not read JWK
+  # from storage". Identity is now trusted from the frontend-supplied
+  # X-User-Subject header instead (mirrors fraud-investigation-system/
+  # Prahari's X-User-Adid model — see that repo's auth/README.md). This is a
+  # known, deliberate, temporary security gap — see
+  # internal/middleware/auth.go's IdentityMiddleware doc comment. Revisit
+  # once JWKS reachability from strot-applications pods is fixed; the
+  # deleted verification code is recoverable from git history.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: velocity-backend-go-secrets
+  namespace: strot-applications
+type: Opaque
+stringData:
+  CLICKHOUSE_PASSWORD: "qwerty"
+  S3_ACCESS_KEY: "9S0KLIQO7T2XCNGH4P4A"
+  S3_SECRET_KEY: "XKlE3EeEQ7MHsvz2O9AXuDEJJDyTFhhCcxSnxtk4"
+  MYSQL_PASSWORD: "WveLocity&17"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velocity-backend-go
+  namespace: strot-applications
+  labels:
+    app: velocity-engine
+    component: backend-go
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: velocity-engine
+      component: backend-go
+  template:
+    metadata:
+      labels:
+        app: velocity-engine
+        component: backend-go
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - dc1cpbuk8won236
+                - dc1cpbuk8won207
+      containers:
+        - name: backend-go
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          image: mndc-harbor-registry-prod.uidai.net.in/data-platform/velocity-engine-control-plane-backend:1.0.7-RELEASE
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: velocity-backend-go-config
+            - secretRef:
+                name: velocity-backend-go-secrets
+          resources:
+            requests:
+              cpu: 2000m
+              memory: 8Gi
+              ephemeral-storage: 10Gi
+            limits:
+              cpu: 4000m
+              memory: 12Gi
+              ephemeral-storage: 25Gi
+          volumeMounts:
+            - name: duckdb-tmp
+              mountPath: /tmp/duckdb
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: duckdb-tmp
+          emptyDir:
+            sizeLimit: 20Gi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+generatorOptions:
+  disableNameSuffixHash: true
+
+resources:
+- service.yaml
+- configmap.yaml
+- deployment.yaml
+
+namespace: strot-applications
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: velocity-backend-svc
+  namespace: strot-applications
+  labels:
+    app: velocity-engine
+    component: backend-go
+spec:
+  loadBalancerIP: 10.10.114.40
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: velocity-engine
+    component: backend-go
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+    nodePort: 30929
